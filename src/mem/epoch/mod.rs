@@ -139,6 +139,17 @@ mod global;
 mod local;
 mod garbage;
 
+// This uses more memory then the vector-backed items,
+// but allows insertion into bag with definitely no allocations
+
+/// The actual memory that backs each allocation
+/// Lets us use freelists and destructors directly in epoch
+struct AllocItem<T> {
+    item: T,
+    ptr: *mut u8,
+    free: unsafe fn(*mut u8),
+}
+
 /// Like `Box<T>`: an owned, heap-allocated data value of type `T`.
 pub struct Owned<T> {
     data: Box<T>,
