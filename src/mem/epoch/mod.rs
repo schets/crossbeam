@@ -420,6 +420,20 @@ pub fn pin() -> Guard {
     })
 }
 
+/// Pins the current epoch but doesn't attempt to collect garbage.
+///
+/// Useful for read-only operations or for avoiding gc
+/// in what needs to be a lock/wait free operation, or
+/// latency sensitive operations
+pub fn pin_nogc() -> Guard {
+    local::with_participant(|p| {
+        p.enter_nogc();
+        return Guard {
+            _marker: marker::PhantomData,
+        };
+    })
+}
+
 impl Guard {
     /// Assert that the value is no longer reachable from a lock-free data
     /// structure and should be collected when sufficient epochs have passed.
@@ -456,6 +470,32 @@ mod test {
             }
         }
         let g = pin();
+
+        let x = Atomic::null();
+        x.store(Some(Owned::new(Test)), Ordering::Relaxed);
+        x.store_and_ref(Owned::new(Test), Ordering::Relaxed, &g);
+        let y = x.load(Ordering::Relaxed, &g);
+        let z = x.cas_and_ref(y, Owned::new(Test), Ordering::Relaxed, &g).ok();
+        let _ = x.cas(z, Some(Owned::new(Test)), Ordering::Relaxed);
+        x.swap(Some(Owned::new(Test)), Ordering::Relaxed, &g);
+
+        unsafe {
+            assert_eq!(DROPS, 0);
+        }
+    }
+
+    #[test]
+    fn test_no_drop_nogc() {
+        static mut DROPS: i32 = 0;
+        struct Test;
+        impl Drop for Test {
+            fn drop(&mut self) {
+                unsafe {
+                    DROPS += 1;
+                }
+            }
+        }
+        let g = pin_nogc();
 
         let x = Atomic::null();
         x.store(Some(Owned::new(Test)), Ordering::Relaxed);

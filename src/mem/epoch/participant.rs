@@ -42,10 +42,27 @@ impl Participant {
         }
     }
 
+
+    ///Enter a critical section, but do not perform any GC
+    ///
+    /// This method is reentrant, allowing for nested critical sections.
+    pub fn enter_nogc(&self) {
+        // This function still updates the current epoch since that gives other
+        // threads more opportunities to advance the epoch - a thread which spends
+        // much of it's time alive BUT never advances the epoch could be problematic
+        self._enter(false);
+    }
+
     /// Enter a critical section.
     ///
     /// This method is reentrant, allowing for nested critical sections.
     pub fn enter(&self) {
+        self._enter(true);
+    }
+
+    /// Actually enters the critical section
+    #[inline(always)]
+    fn _enter(&self, do_gc: bool) {
         let new_count = self.in_critical.load(Relaxed) + 1;
         self.in_critical.store(new_count, Relaxed);
         if new_count > 1 { return }
@@ -55,7 +72,7 @@ impl Participant {
         let global_epoch = global::get().epoch.load(Relaxed);
         if global_epoch != self.epoch.load(Relaxed) {
             self.epoch.store(global_epoch, Relaxed);
-            unsafe { (*self.garbage.get()).collect(); }
+            if do_gc { unsafe { (*self.garbage.get()).collect(); } }
         }
     }
 
@@ -109,6 +126,7 @@ impl Participant {
     }
 
     /// How much garbage is this participant currently storing?
+    #[inline(always)]
     pub fn garbage_size(&self) -> usize {
         unsafe { (*self.garbage.get()).size() }
     }
