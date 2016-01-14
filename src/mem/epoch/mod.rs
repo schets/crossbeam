@@ -396,29 +396,30 @@ pub struct Guard {
 
 static GC_THRESH: usize = 32;
 
-/// Runs the garbage collector
+/// Runs the garbage collector, returns whether global and local GC ran
 #[inline(always)]
-pub fn run_gc() {
-    _run_gc(true);
+pub fn run_gc() -> (bool, bool) {
+    _run_gc(true)
 }
 
 /// Runs the local collector only, does not advance the epoch
 #[inline(always)]
-pub fn run_local_gc() {
-    _run_gc(false);
+pub fn run_local_gc() -> bool {
+    _run_gc(false).1
 }
 
-fn _run_gc(global: bool) {
+fn _run_gc(global: bool) -> (bool, bool) {
    local::with_participant(|p| {
-       p.enter();
+       let did_local = p.enter();
 
        let g = Guard {
            _marker: marker::PhantomData,
        };
 
        if global {
-           p.try_collect(&g);
+           return (did_local, p.try_collect(&g));
        }
+       return (did_local, false)
   })
 }
 

@@ -53,27 +53,31 @@ impl Participant {
         self._enter(false);
     }
 
-    /// Enter a critical section.
+    /// Enter a critical section and returns whether GC happened.
     ///
     /// This method is reentrant, allowing for nested critical sections.
-    pub fn enter(&self) {
-        self._enter(true);
+    pub fn enter(&self) -> bool{
+        self._enter(true)
     }
 
     /// Actually enters the critical section
     #[inline(always)]
-    fn _enter(&self, do_gc: bool) {
+    fn _enter(&self, do_gc: bool) -> bool {
         let new_count = self.in_critical.load(Relaxed) + 1;
         self.in_critical.store(new_count, Relaxed);
-        if new_count > 1 { return }
+        if new_count > 1 { return false}
 
         atomic::fence(SeqCst);
 
         let global_epoch = global::get().epoch.load(Relaxed);
         if global_epoch != self.epoch.load(Relaxed) {
             self.epoch.store(global_epoch, Relaxed);
-            if do_gc { unsafe { (*self.garbage.get()).collect(); } }
+            if do_gc {
+                unsafe { (*self.garbage.get()).collect(); }
+                return true
+            }
         }
+        false
     }
 
     /// Exit the current (nested) critical section.
