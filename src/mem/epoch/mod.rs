@@ -396,6 +396,33 @@ pub struct Guard {
 
 static GC_THRESH: usize = 32;
 
+/// Runs the garbage collector
+#[inline(always)]
+pub fn run_gc() {
+    _run_gc(true);
+}
+
+/// Runs the local collector only, does not advance the epoch
+#[inline(always)]
+pub fn run_local_gc() {
+    _run_gc(false);
+}
+
+fn _run_gc(global: bool) {
+   local::with_participant(|p| {
+       p.enter();
+
+       let g = Guard {
+           _marker: marker::PhantomData,
+       };
+
+       if global {
+           p.try_collect(&g);
+       }
+  })
+}
+
+
 /// Pin the current epoch.
 ///
 /// Threads generally pin before interacting with a lock-free data
