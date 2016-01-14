@@ -25,6 +25,9 @@ pub struct Participant {
     /// is ultimately used to free `Participant` records.
     pub active: AtomicBool,
 
+    /// Should pin attempt a GC
+    pub try_gc: AtomicBool,
+
     /// The participant list is coded intrusively; here's the `next` pointer.
     pub next: Atomic<ParticipantNode>,
 }
@@ -37,11 +40,11 @@ impl Participant {
             epoch: AtomicUsize::new(0),
             in_critical: AtomicUsize::new(0),
             active: AtomicBool::new(true),
+            try_gc: AtomicBool::new(true),
             garbage: UnsafeCell::new(garbage::Local::new()),
             next: Atomic::null(),
         }
     }
-
 
     ///Enter a critical section, but do not perform any GC
     ///
@@ -126,7 +129,6 @@ impl Participant {
     }
 
     /// How much garbage is this participant currently storing?
-    #[inline(always)]
     pub fn garbage_size(&self) -> usize {
         unsafe { (*self.garbage.get()).size() }
     }
