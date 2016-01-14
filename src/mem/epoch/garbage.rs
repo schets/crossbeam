@@ -15,7 +15,7 @@ use mem::ZerosValid;
 
 /// One item of garbage.
 ///
-/// Stores enough information to do a deallocation.
+/// Stores enough information to do a deallocation and a possible destruction.
 struct Item {
     ptr: *mut u8,
     free: unsafe fn(*mut u8),
@@ -29,16 +29,19 @@ impl Bag {
         Bag(vec![])
     }
 
-    fn insert<T>(&mut self, elem: *mut T) {
+    fn insert<T>(&mut self, elem: *mut T, do_drop: bool) {
         let size = mem::size_of::<T>();
         if size > 0 {
             self.0.push(Item {
                 ptr: elem as *mut u8,
-                free: free::<T>,
+                free: if do_drop { destroy::<T> } else { free::<T> },
             })
         }
         unsafe fn free<T>(t: *mut u8) {
             drop(Vec::from_raw_parts(t as *mut T, 0, 1));
+        }
+        unsafe fn destroy<T>(t: *mut u8) {
+            Box::from_raw(t as *mut T);
         }
     }
 
@@ -80,8 +83,8 @@ impl Local {
         }
     }
 
-    pub fn insert<T>(&mut self, elem: *mut T) {
-        self.new.insert(elem)
+    pub fn insert<T>(&mut self, elem: *mut T, drop: bool) {
+        self.new.insert(elem, drop)
     }
 
     /// Collect one epoch of garbage, rotating the local garbage bags.

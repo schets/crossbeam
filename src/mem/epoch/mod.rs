@@ -429,7 +429,14 @@ impl Guard {
     /// Assert that the value is no longer reachable from a lock-free data
     /// structure and should be collected when sufficient epochs have passed.
     pub unsafe fn unlinked<T>(&self, val: Shared<T>) {
-        local::with_participant(|p| p.reclaim(val.as_raw()))
+        local::with_participant(|p| p.reclaim(val.as_raw(), false))
+    }
+
+    /// Assert that the value is no longer reachable from a lock-free data
+    /// structure and should be collected and destroyed
+    /// when sufficient epochs have passed.
+    pub unsafe fn unlinked_drop<T: Drop>(&self, val: Shared<T>) {
+        local::with_participant(|p| p.reclaim(val.as_raw(), true))
     }
 
     /// Move the thread-local garbage into the global set of garbage.
@@ -473,6 +480,41 @@ mod test {
 
         unsafe {
             assert_eq!(DROPS, 0);
+        }
+    }
+
+    #[test]
+    fn test_drop() {
+        static mut DROPS: i32 = 0;
+        static RUNS: i32 = 10000;
+        struct Test;
+        impl Drop for Test {
+            fn drop(&mut self) {
+                unsafe {
+                    DROPS += 1;
+                }
+            }
+        }
+        //unlinked and dropping...
+        for _ in 0..RUNS {
+            let g = pin();
+
+            let x = Atomic::null();
+            x.store(Some(Owned::new(Test)), Ordering::Relaxed);
+            unsafe { g.unlinked_drop(x.load(Ordering::Relaxed, &g).unwrap()); }
+        }
+
+        // unlinking but not dropping, enough to flush all the garbage
+        for _ in 0..RUNS {
+            let g = pin();
+
+            let x = Atomic::null();
+            x.store(Some(Owned::new(Test)), Ordering::Relaxed);
+            unsafe { g.unlinked(x.load(Ordering::Relaxed, &g).unwrap()); }
+        }
+
+        unsafe {
+            assert_eq!(DROPS, RUNS);
         }
     }
 
