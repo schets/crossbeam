@@ -397,10 +397,19 @@ impl<T> Atomic<T> {
 /// This feature allows that to happen in a defined scope,
 /// and also allows re-enabling (and re-disabling, and re-re-enabling,)
 /// of the gc
+#[must_use]
 pub struct GCControl {
     /// Stores whether gc was previously enabled or not
     previous: bool,
-    _marker: marker::PhantomData<*mut ()>, // !Send and !Sync
+}
+
+impl Drop for GCControl {
+    #[inline(always)]
+    fn drop(&mut self) {
+        local::with_participant(|p| {
+            p.try_gc.store(self.previous, Relaxed)
+        })
+    }
 }
 
 #[inline(always)]
@@ -411,34 +420,48 @@ pub fn is_gc_enabled() -> bool {
 }
 
 #[inline(always)]
-pub fn set_gc_scoped(turn_on: bool) -> GCControl {
+pub fn __get_gc_guard_for(turn_on: bool) -> GCControl {
     local::with_participant(|p| {
         let gcc = GCControl {
             previous: p.try_gc.load(Relaxed),
-            _marker: marker::PhantomData,
         };
         p.try_gc.store(turn_on, Relaxed);
         gcc
     })
 }
 
-#[inline(always)]
-pub fn enable_gc_scoped() -> GCControl {
-    set_gc_scoped(true)
+macro_rules! _set_gc_scope {($x:expr, $code:block) => ({
+    let _temp_guard = __get_gc_guard_for($x);
+    $code
+})}
+
+
+#[macro_export]
+macro_rules! set_gc_scope {
+    ($x:expr, $code:expr) => (_set_gc_scope!($x, {$code}));
+    ($x:expr, $code:expr;) => (_set_gc_scope!($x, {$code}));
+    ($x:expr, $code:stmt) => (_set_gc_scope!($x, {$code}));
+    ($x:expr, $code:stmt;) => (_set_gc_scope!($x, {$code}));
+    ($x:expr, $code:block;) => (_set_gc_scope!($x, $code));
 }
 
-#[inline(always)]
-pub fn disable_gc_scoped() -> GCControl {
-    set_gc_scoped(false)
+#[macro_export]
+macro_rules! disable_gc_scope {
+    ($code:expr) => (set_gc_scope!(false, {$code}));
+    ($code:expr;) => (set_gc_scope!(false, {$code;}));
+    ($code:stmt) => (set_gc_scope!(false, {$code}));
+    ($code:stmt;) => (set_gc_scope!(false, {$code;}));
+    ($code:block) => (set_gc_scope!(false, $code));
 }
 
-impl Drop for GCControl {
-    #[inline(always)]
-    fn drop(&mut self) {
-        local::with_participant(|p| {
-            p.try_gc.store(self.previous, Relaxed)
-        })
-    }
+
+#[macro_export]
+macro_rules! enable_gc_scope {
+    ($code:expr) => (set_gc_scope!(true, {$code}));
+    ($code:expr;) => (set_gc_scope!(true, {$code;}));
+    ($code:stmt) => (set_gc_scope!(true, {$code}));
+    ($code:stmt;) => (set_gc_scope!(true, {$code;}));
+    ($code:block) => (set_gc_scope!(true, $code));
 }
 
 
@@ -453,33 +476,55 @@ pub struct Guard {
 
 static GC_THRESH: usize = 32;
 
-/// Runs the garbage collector, returns whether global and local GC ran
+/// Tries the garbage collector, returns whether global and local GC ran
+///
+/// This fails if the gc is currently disabled
 #[inline(always)]
-pub fn run_gc() -> (bool, bool) {
-    _run_gc(true)
+pub fn try_gc() -> (bool, bool) {
+    _run_gc(true, false)
 }
 
-/// Runs the local collector only, does not advance the epoch
+/// Forces an attempt of garbage collection, returns whether global/local GC ran
+///
+/// This always tries even if the gc is disabled
 #[inline(always)]
-pub fn run_local_gc() -> bool {
-    _run_gc(false).1
+pub fn force_gc() -> (bool, bool) {
+    _run_gc(true, true)
 }
 
-fn _run_gc(global: bool) -> (bool, bool) {
+/// Tries the local collector only, does not advance the epoch
+///
+/// This fails if the gc is currently disabled
+#[inline(always)]
+pub fn try_local_gc() -> bool {
+    _run_gc(false, false).1
+}
+
+/// Tries the local collector only, does not advance the epoch
+///
+/// This always tries even if the gc is disabled
+#[inline(always)]
+pub fn force_local_gc() -> bool {
+    _run_gc(false, false).1
+}
+
+fn _run_gc(global: bool, force: bool) -> (bool, bool) {
    local::with_participant(|p| {
-       let did_local = p.enter();
+       if force || p.try_gc.load(Relaxed) {
+           let did_local = p.enter();
 
-       let g = Guard {
-           _marker: marker::PhantomData,
-       };
+           let g = Guard {
+               _marker: marker::PhantomData,
+           };
 
-       if global {
-           return (did_local, p.try_collect(&g));
+           if global {
+               return (did_local, p.try_collect(&g));
+           }
+           return (did_local, false)
        }
-       return (did_local, false)
+       (false, false)
   })
 }
-
 
 /// Pin the current epoch.
 ///
@@ -494,13 +539,6 @@ pub fn pin() -> Guard {
     local::with_participant(|p| {
         if p.try_gc.load(Relaxed) { _pin_gc(p) } else { _pin_nogc(p) }
     })
-}
-
-
-/// Pins the current epoch and always tries a GC
-#[inline(always)]
-pub fn pin_gc() -> Guard {
-    local::with_participant(_pin_gc)
 }
 
 /// Pins the current epoch but doesn't attempt to collect garbage.
@@ -619,35 +657,26 @@ mod test {
     #[test]
     fn test_gc_disable() {
         assert_eq!(is_gc_enabled(), true);
-        {
-            let gc_guard = disable_gc_scoped();
+        disable_gc_scope! {
             assert_eq!(is_gc_enabled(), false);
         }
         assert_eq!(is_gc_enabled(), true);
     }
 
     #[test]
-    fn test_gc_disable_enable() {
-        assert_eq!(is_gc_enabled(), true);
-        {
-            let gc_guard = disable_gc_scoped();
+    fn test_gc_control_scope() {
+        disable_gc_scope!{{
             assert_eq!(is_gc_enabled(), false);
-            let gc_guard2 = enable_gc_scoped();
-            assert_eq!(is_gc_enabled(), true);
-            {
-                let gc_guard = disable_gc_scoped();
-                assert_eq!(is_gc_enabled(), false);
-                {
-                    let gc_guard2 = enable_gc_scoped();
-                    assert_eq!(is_gc_enabled(), true);
+            enable_gc_scope! {{
+                assert_eq!(is_gc_enabled(), true);
+                disable_gc_scope! {
+                    assert_eq!(is_gc_enabled(), false);
                 }
-                assert_eq!(is_gc_enabled(), false);
-            }
-            assert_eq!(is_gc_enabled(), true);
-            let gc_guard3 = disable_gc_scoped();
+                assert_eq!(is_gc_enabled(), true);
+            }}
             assert_eq!(is_gc_enabled(), false);
-        }
+        }}
         assert_eq!(is_gc_enabled(), true);
-    }
 
+    }
 }
