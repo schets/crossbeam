@@ -396,7 +396,7 @@ impl<T> Atomic<T> {
 /// one wants to delay deallocation to a later period, etc
 /// This feature allows that to happen in a defined scope,
 /// and also allows re-enabling (and re-disabling, and re-re-enabling,)
-/// of the gc
+/// of the gc.
 #[must_use]
 pub struct GCControl {
     /// Stores whether gc was previously enabled or not
@@ -412,6 +412,7 @@ impl Drop for GCControl {
     }
 }
 
+/// This returns a variable determining whether the GC is enabled or not
 #[inline(always)]
 pub fn is_gc_enabled() -> bool {
     local::with_participant(|p| {
@@ -435,7 +436,6 @@ macro_rules! _set_gc_scope {($x:expr, $code:block) => ({
     $code
 })}
 
-
 #[macro_export]
 macro_rules! set_gc_scope {
     ($x:expr, $code:expr) => (_set_gc_scope!($x, {$code}));
@@ -445,6 +445,11 @@ macro_rules! set_gc_scope {
     ($x:expr, $code:block;) => (_set_gc_scope!($x, $code));
 }
 
+/// Disables gc in the given scope
+///
+/// Allows disabling GC in a scope, useful for latency sensitive
+/// code. Be careful when performing writes in this scope - it's good to let
+/// garbage get collected at some point
 #[macro_export]
 macro_rules! disable_gc_scope {
     ($code:expr) => (set_gc_scope!(false, {$code}));
@@ -454,7 +459,10 @@ macro_rules! disable_gc_scope {
     ($code:block) => (set_gc_scope!(false, $code));
 }
 
-
+/// Enables the gc in the given scope
+///
+/// Allows enabling the gc in a scope - library writers be careful -
+/// this *will* override disable_gc scopes from a user.
 #[macro_export]
 macro_rules! enable_gc_scope {
     ($code:expr) => (set_gc_scope!(true, {$code}));
@@ -474,43 +482,32 @@ pub struct Guard {
     _marker: marker::PhantomData<*mut ()>, // !Send and !Sync
 }
 
-static GC_THRESH: usize = 32;
+/// Threshold for automatically advancing the epoch
+const GC_THRESH: usize = 32;
+
+/// Threshold for moving garbage to global when GC is disabled
+const GC_MIGRATE_THRESH: usize = GC_THRESH * 4;
 
 /// Tries the garbage collector, returns whether global and local GC ran
 ///
-/// This fails if the gc is currently disabled
+/// If the local GC is disabled, returns None
 #[inline(always)]
-pub fn try_gc() -> (bool, bool) {
-    _run_gc(true, false)
-}
-
-/// Forces an attempt of garbage collection, returns whether global/local GC ran
-///
-/// This always tries even if the gc is disabled
-#[inline(always)]
-pub fn force_gc() -> (bool, bool) {
-    _run_gc(true, true)
+pub fn try_gc() -> Option<(bool, bool)> {
+    _run_gc(true)
 }
 
 /// Tries the local collector only, does not advance the epoch
 ///
-/// This fails if the gc is currently disabled
+/// If the local gc is disabled, returns None
 #[inline(always)]
-pub fn try_local_gc() -> bool {
-    _run_gc(false, false).1
+pub fn try_local_gc() -> Option<bool> {
+    _run_gc(false).map(|rv| rv.1)
 }
 
-/// Tries the local collector only, does not advance the epoch
-///
-/// This always tries even if the gc is disabled
-#[inline(always)]
-pub fn force_local_gc() -> bool {
-    _run_gc(false, false).1
-}
-
-fn _run_gc(global: bool, force: bool) -> (bool, bool) {
+/// Runs the gc, globally/locally and forced/unforced
+fn _run_gc(global: bool) -> Option<(bool, bool)> {
    local::with_participant(|p| {
-       if force || p.try_gc.load(Relaxed) {
+       if p.try_gc.load(Relaxed) {
            let did_local = p.enter();
 
            let g = Guard {
@@ -518,11 +515,11 @@ fn _run_gc(global: bool, force: bool) -> (bool, bool) {
            };
 
            if global {
-               return (did_local, p.try_collect(&g));
+               return Some((did_local, p.try_collect(&g)));
            }
-           return (did_local, false)
+           return Some((did_local, false))
        }
-       (false, false)
+       None
   })
 }
 
@@ -533,11 +530,13 @@ fn _run_gc(global: bool, force: bool) -> (bool, bool) {
 /// expensive. It is rentrant -- you can safely acquire nested guards, and only
 /// the first guard requires a barrier. Thus, in cases where you expect to
 /// perform several lock-free operations in quick succession, you may consider
-/// pinning around the entire set of operations.
+/// pinning around the entire set of operations. If gc is locally enabled,
+/// this may perform a garbage collection. Otherwise, it may attempt to
+/// migrate garbage
 #[inline(always)]
 pub fn pin() -> Guard {
     local::with_participant(|p| {
-        if p.try_gc.load(Relaxed) { _pin_gc(p) } else { _pin_nogc(p) }
+        if p.try_gc.load(Relaxed) { _pin_gc(p) } else { _pin_nogc(p, false) }
     })
 }
 
@@ -546,10 +545,25 @@ pub fn pin() -> Guard {
 /// Useful for read-only operations or for avoiding gc
 /// in what needs to be a lock/wait free operation, or
 /// latency sensitive operations. This call will not gc even
-/// if gc is locally enabled
+/// if gc is locally enabled, but it will eventually
+/// migrate garbage to the global scope which allocates and is lockfree
 #[inline(always)]
 pub fn pin_nogc() -> Guard {
-    local::with_participant(_pin_nogc)
+    local::with_participant(|p| _pin_nogc(p, false))
+}
+
+/// Pins the current epoch but doesn't attempt to collect or migrate garbage.
+///
+/// Useful for read-only operations or for avoiding gc
+/// in what needs to be a wait free operation, or
+/// latency sensitive operations. This call will not gc even
+/// if gc is locally enabled, and will never migrate garbage.
+/// Be very careful using pin_waitfree on a function call
+/// that unlinks data, and consider pin_nogc on anything that's
+/// only lockfree or already allocates
+#[inline(always)]
+pub fn pin_waitfree() -> Guard {
+    local::with_participant(|p| _pin_nogc(p, true))
 }
 
 fn _pin_gc(p: &Participant) -> Guard {
@@ -566,8 +580,13 @@ fn _pin_gc(p: &Participant) -> Guard {
     g
 }
 
-pub fn _pin_nogc(p: &Participant) -> Guard {
+pub fn _pin_nogc(p: &Participant, waitfree: bool) -> Guard {
     p.enter_nogc();
+
+    if !waitfree && p.garbage_size() > GC_MIGRATE_THRESH {
+        p.migrate_garbage();
+    }
+
     Guard {
         _marker: marker::PhantomData,
     }
