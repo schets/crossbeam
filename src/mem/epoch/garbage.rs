@@ -22,16 +22,17 @@ struct Item {
 }
 
 /// A single, thread-local bag of garbage.
-pub struct Bag(Vec<Item>);
+pub struct Bag(Vec<Item>, usize);
 
 impl Bag {
     fn new() -> Bag {
-        Bag(vec![])
+        Bag(vec![], 0)
     }
 
     fn insert<T>(&mut self, elem: *mut T) {
         let size = mem::size_of::<T>();
         if size > 0 {
+            self.1 += size;
             self.0.push(Item {
                 ptr: elem as *mut u8,
                 free: free::<T>,
@@ -46,6 +47,10 @@ impl Bag {
         self.0.len()
     }
 
+    fn bytes(&self) -> usize {
+        self.1
+    }
+
     /// Deallocate all garbage in the bag
     pub unsafe fn collect(&mut self) {
         let mut data = mem::replace(&mut self.0, Vec::new());
@@ -54,6 +59,7 @@ impl Bag {
         }
         data.truncate(0);
         self.0 = data;
+        self.1 = 0;
     }
 }
 
@@ -70,6 +76,8 @@ pub struct Local {
     pub cur: Bag,
     /// Garbage added in the current *global* epoch
     pub new: Bag,
+    /// Amount of garbage contained in each bag
+    pub bytes: usize,
 }
 
 impl Local {
@@ -78,15 +86,18 @@ impl Local {
             old: Bag::new(),
             cur: Bag::new(),
             new: Bag::new(),
+            bytes: 0,
         }
     }
 
     pub fn reclaim<T>(&mut self, elem: *mut T) {
+        self.bytes += mem::size_of::<T>();
         self.new.insert(elem)
     }
 
     /// Collect one epoch of garbage, rotating the local garbage bags.
     pub unsafe fn collect(&mut self) {
+        self.bytes -= self.old.bytes();
         let ret = self.old.collect();
         mem::swap(&mut self.old, &mut self.cur);
         mem::swap(&mut self.cur, &mut self.new);
@@ -136,5 +147,9 @@ impl ConcBag {
                 head = n.next.load(Relaxed);
             }
         }
+    }
+
+    pub fn has_garbage(&self) -> bool {
+        self.head.load(Relaxed) != ptr::null_mut()
     }
 }

@@ -401,7 +401,6 @@ pub struct Guard {
     _marker: marker::PhantomData<*mut ()>, // !Send and !Sync
 }
 
-static GC_THRESH: usize = 32;
 
 /// Pin the current epoch.
 ///
@@ -419,9 +418,7 @@ pub fn pin() -> Guard {
             _marker: marker::PhantomData,
         };
 
-        if p.garbage_size() > GC_THRESH {
-            p.try_collect(&g);
-        }
+        p.gc_if_needed(&g);
 
         g
     })
