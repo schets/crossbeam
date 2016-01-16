@@ -112,4 +112,10 @@ impl Participant {
     pub fn garbage_size(&self) -> usize {
         unsafe { (*self.garbage.get()).size() }
     }
+
+    /// How many bytes of garbage is this participant currently storing?
+    pub fn garbage_bytes(&self) -> usize {
+        unsafe { (*self.garbage.get()).bytes }
+    }
+
 }
