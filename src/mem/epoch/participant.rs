@@ -9,6 +9,8 @@ use std::sync::atomic::Ordering::{Relaxed, Acquire, Release, SeqCst};
 use mem::epoch::{Atomic, Guard, garbage, global};
 use mem::epoch::participants::ParticipantNode;
 
+static GC_THRESH: usize = 32;
+
 /// Thread-local data for epoch participation.
 pub struct Participant {
     /// The local epoch.
@@ -93,19 +95,32 @@ impl Participant {
         self.epoch.store(new_epoch, Relaxed);
 
         unsafe {
-            global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
+             global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
         }
 
+        global::get().set_garbage_flag();
         true
     }
 
+    pub fn needs_gc(&self) -> bool {
+        self.garbage_size() > GC_THRESH || global::get().do_global.load(Relaxed)
+
+    }
+
+    /// Checks if GC needs to happen and tries to perform it if so
+    pub fn gc_if_needed(&self, guard: &Guard) -> bool {
+        if self.needs_gc() { self.try_collect(guard) } else { false }
+    }
+
     /// Move the current thread-local garbage into the global garbage bags.
-    pub fn migrate_garbage(&self) {
+    pub fn migrate_garbage(&self, set_flag: bool) {
         let cur_epoch = self.epoch.load(Relaxed);
         let local = unsafe { mem::replace(&mut *self.garbage.get(), garbage::Local::new()) };
         global::get().garbage[cur_epoch.wrapping_sub(1) % 3].insert(local.old);
         global::get().garbage[cur_epoch % 3].insert(local.cur);
         global::get().garbage[global::get().epoch.load(Relaxed) % 3].insert(local.new);
+        // Setting the flag on thread exit results in a segfault
+        if set_flag { global::get().set_garbage_flag(); }
     }
 
     /// How much garbage is this participant currently storing?

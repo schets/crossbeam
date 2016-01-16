@@ -394,7 +394,6 @@ pub struct Guard {
     _marker: marker::PhantomData<*mut ()>, // !Send and !Sync
 }
 
-static GC_THRESH: usize = 32;
 
 /// Pin the current epoch.
 ///
@@ -412,9 +411,7 @@ pub fn pin() -> Guard {
             _marker: marker::PhantomData,
         };
 
-        if p.garbage_size() > GC_THRESH {
-            p.try_collect(&g);
-        }
+        p.gc_if_needed(&g);
 
         g
     })
@@ -429,7 +426,7 @@ impl Guard {
 
     /// Move the thread-local garbage into the global set of garbage.
     pub fn migrate_garbage(&self) {
-        local::with_participant(|p| p.migrate_garbage())
+        local::with_participant(|p| p.migrate_garbage(true))
     }
 }
 

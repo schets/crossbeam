@@ -133,4 +133,8 @@ impl ConcBag {
             head = n.next.load(Relaxed);
         }
     }
+
+    pub fn has_garbage(&self) -> bool {
+        self.head.load(Relaxed) != ptr::null_mut()
+    }
 }

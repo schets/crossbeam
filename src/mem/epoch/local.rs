@@ -24,7 +24,7 @@ impl Drop for LocalEpoch {
     fn drop(&mut self) {
         let p = self.get();
         p.enter();
-        p.migrate_garbage();
+        p.migrate_garbage(false);
         p.exit();
         p.active.store(false, Relaxed);
     }
