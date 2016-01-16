@@ -436,14 +436,19 @@ macro_rules! _set_gc_scope {($x:expr, $code:block) => ({
     $code
 })}
 
+/// Sets the gc in the given scope
+///
+/// First parameter must evaluate to a boolean
 #[macro_export]
 macro_rules! set_gc_scope {
-    ($x:expr, $code:expr) => (_set_gc_scope!($x, {$code}));
-    ($x:expr, $code:expr;) => (_set_gc_scope!($x, {$code}));
-    ($x:expr, $code:stmt) => (_set_gc_scope!($x, {$code}));
-    ($x:expr, $code:stmt;) => (_set_gc_scope!($x, {$code}));
-    ($x:expr, $code:block;) => (_set_gc_scope!($x, $code));
-}
+    ($x:expr, $code:expr) => ({
+        let _temp_guard = __get_gc_guard_for($x);
+        $code
+    }
+                              )}
+
+// Would a strong sense of disabling be usefull
+// So that someone can override a library enabling GC willy-nilly?
 
 /// Disables gc in the given scope
 ///
@@ -452,11 +457,7 @@ macro_rules! set_gc_scope {
 /// garbage get collected at some point
 #[macro_export]
 macro_rules! disable_gc_scope {
-    ($code:expr) => (set_gc_scope!(false, {$code}));
-    ($code:expr;) => (set_gc_scope!(false, {$code;}));
-    ($code:stmt) => (set_gc_scope!(false, {$code}));
-    ($code:stmt;) => (set_gc_scope!(false, {$code;}));
-    ($code:block) => (set_gc_scope!(false, $code));
+    ($code:expr) => (set_gc_scope!(false, $code));
 }
 
 /// Enables the gc in the given scope
@@ -465,11 +466,7 @@ macro_rules! disable_gc_scope {
 /// this *will* override disable_gc scopes from a user.
 #[macro_export]
 macro_rules! enable_gc_scope {
-    ($code:expr) => (set_gc_scope!(true, {$code}));
-    ($code:expr;) => (set_gc_scope!(true, {$code;}));
-    ($code:stmt) => (set_gc_scope!(true, {$code}));
-    ($code:stmt;) => (set_gc_scope!(true, {$code;}));
-    ($code:block) => (set_gc_scope!(true, $code));
+    ($code:expr) => (set_gc_scope!(true, $code));
 }
 
 
@@ -490,7 +487,7 @@ const GC_MIGRATE_THRESH: usize = GC_THRESH * 4;
 
 /// Tries the garbage collector, returns whether global and local GC ran
 ///
-/// If the local GC is disabled, returns None
+/// If the GC is disabled, returns None
 #[inline(always)]
 pub fn try_gc() -> Option<(bool, bool)> {
     _run_gc(true)
@@ -498,7 +495,7 @@ pub fn try_gc() -> Option<(bool, bool)> {
 
 /// Tries the local collector only, does not advance the epoch
 ///
-/// If the local gc is disabled, returns None
+/// If the gc is disabled, returns None
 #[inline(always)]
 pub fn try_local_gc() -> Option<bool> {
     _run_gc(false).map(|rv| rv.1)
@@ -677,7 +674,7 @@ mod test {
     fn test_gc_disable() {
         assert_eq!(is_gc_enabled(), true);
         disable_gc_scope! {
-            assert_eq!(is_gc_enabled(), false);
+            assert_eq!(is_gc_enabled(), false)
         }
         assert_eq!(is_gc_enabled(), true);
     }
@@ -689,7 +686,7 @@ mod test {
             enable_gc_scope! {{
                 assert_eq!(is_gc_enabled(), true);
                 disable_gc_scope! {
-                    assert_eq!(is_gc_enabled(), false);
+                    assert_eq!(is_gc_enabled(), false)
                 }
                 assert_eq!(is_gc_enabled(), true);
             }}
