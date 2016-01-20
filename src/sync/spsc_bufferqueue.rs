@@ -78,8 +78,8 @@ impl<T: Send> SpscBufferQueue<T> {
     }
 
     /// Performs the actual push
-    #[inline(always)]
-    fn do_push<F>(&self, ctor: F, ret: bool) -> Option<T> where F: FnOnce() -> T {
+    fn try_construct<F>(&self, ctor: F) -> Option<F>
+                  where F: FnOnce() -> T {
         let ctail = self.tail.load(Relaxed);
         let mut next_tail = ctail + 1;
         next_tail = if next_tail == self.size  { 0 } else { next_tail };
@@ -87,12 +87,7 @@ impl<T: Send> SpscBufferQueue<T> {
             let cur_head = self.head.load(Acquire);
             self.head_cache.store(cur_head, Relaxed);
             if next_tail == cur_head {
-                if ret {
-                    return Some(ctor());
-                }
-                else {
-                    return None;
-                }
+                return Some(ctor);
             }
         }
         unsafe {
@@ -104,24 +99,10 @@ impl<T: Send> SpscBufferQueue<T> {
         None
     }
 
-    /// If there's room in the queue, constructs and inserts an element
-    pub fn try_construct<F>(&self, ctor: F) -> bool where F: FnOnce() -> T {
-        match self.do_push(ctor, false) {
-            Some(_) => false,
-            None => true
-        }
-    }
-    /// Tries pushing the element onto the queue
-    ///
-    /// According to the caller, either returns the element on failure
-    /// or returns None
+    /// Tries pushing the element onto the queue, returns value on failure
+    #[inline(always)]
     pub fn try_push(&self, val: T) -> Option<T> {
-        self.do_push(|| val, true)
-    }
-
-    /// Tries pushing the element onto the queue, drops the value on failure
-    pub fn push_drop(&self, val: T) -> bool {
-        self.try_construct(|| val)
+        self.try_construct(|| val).map(|f| f())
     }
 
     pub fn try_pop(&self) -> Option<T> {
@@ -250,12 +231,6 @@ impl<T: Send> BufferProducer<T> {
     #[inline(always)]
     pub fn try_push(&self, val: T) -> Option<T> {
         self.spsc.try_push(val)
-    }
-
-    /// Tries pushing the element onto the queue, drops the value on failure
-    #[inline(always)]
-    pub fn push_drop(&self, val: T) -> bool {
-        self.spsc.push_drop(val)
     }
 
     /// If there's room in the queue, constructs and inserts an element
