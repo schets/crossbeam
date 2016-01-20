@@ -456,7 +456,7 @@ macro_rules! set_gc_scope {
         let _temp_guard = __get_gc_guard_for($x);
         $code
     }
-                              )}
+    )}
 
 // Would a strong sense of disabling be usefull
 // So that someone can override a library enabling GC willy-nilly?
@@ -514,21 +514,21 @@ pub fn try_local_gc() -> Option<bool> {
 
 /// Runs the gc, globally/locally and forced/unforced
 fn _run_gc(global: bool) -> Option<(bool, bool)> {
-   local::with_participant(|p| {
-       if p.try_gc.load(Relaxed) {
-           let did_local = p.enter();
+    local::with_participant(|p| {
+        if p.try_gc.load(Relaxed) {
+            let did_local = p.enter();
 
-           let g = Guard {
-               _marker: marker::PhantomData,
-           };
+            let g = Guard {
+                _marker: marker::PhantomData,
+            };
 
-           if global {
-               return Some((did_local, p.try_collect(&g)));
-           }
-           return Some((did_local, false))
-       }
-       None
-  })
+            if global {
+                return Some((did_local, p.try_collect(&g)));
+            }
+            return Some((did_local, false))
+        }
+        None
+    })
 }
 
 /// Pin the current epoch.
