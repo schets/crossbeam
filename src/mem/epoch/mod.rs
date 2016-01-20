@@ -128,6 +128,7 @@
 
 use std::marker::PhantomData;
 use std::marker;
+use std::cell::Cell;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
@@ -398,12 +399,20 @@ impl<T> Atomic<T> {
 /// and also allows re-enabling (and re-disabling, and re-re-enabling,)
 /// of the gc.
 #[must_use]
-pub struct GCControl {
+pub struct GCControl<'a> {
     /// Stores whether gc was previously enabled or not
     previous: bool,
+    /// Make this immovable
+    _nomove: Cell<Option<&'a bool>>,
 }
 
-impl Drop for GCControl {
+impl<'a> GCControl<'a> {
+    fn _lock(&'a self) {
+        self._nomove.set(Some(&self.previous))
+    }
+}
+
+impl<'a> Drop for GCControl<'a> {
     #[inline(always)]
     fn drop(&mut self) {
         local::with_participant(|p| {
@@ -421,10 +430,11 @@ pub fn is_gc_enabled() -> bool {
 }
 
 #[inline(always)]
-pub fn __get_gc_guard_for(turn_on: bool) -> GCControl {
+pub fn __get_gc_guard_for<'a>(turn_on: bool) -> GCControl<'a> {
     local::with_participant(|p| {
         let gcc = GCControl {
             previous: p.try_gc.load(Relaxed),
+            _nomove: Cell::new(None),
         };
         p.try_gc.store(turn_on, Relaxed);
         gcc
@@ -433,6 +443,7 @@ pub fn __get_gc_guard_for(turn_on: bool) -> GCControl {
 
 macro_rules! _set_gc_scope {($x:expr, $code:block) => ({
     let _temp_guard = __get_gc_guard_for($x);
+    _temp_guard._lock();
     $code
 })}
 
