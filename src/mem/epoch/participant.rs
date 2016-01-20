@@ -25,6 +25,9 @@ pub struct Participant {
     /// is ultimately used to free `Participant` records.
     pub active: AtomicBool,
 
+    /// Should pin attempt a GC
+    pub try_gc: AtomicBool,
+
     /// The participant list is coded intrusively; here's the `next` pointer.
     pub next: Atomic<ParticipantNode>,
 }
@@ -37,26 +40,47 @@ impl Participant {
             epoch: AtomicUsize::new(0),
             in_critical: AtomicUsize::new(0),
             active: AtomicBool::new(true),
+            try_gc: AtomicBool::new(true),
             garbage: UnsafeCell::new(garbage::Local::new()),
             next: Atomic::null(),
         }
     }
 
-    /// Enter a critical section.
+    ///Enter a critical section, but do not perform any GC
     ///
     /// This method is reentrant, allowing for nested critical sections.
-    pub fn enter(&self) {
+    pub fn enter_nogc(&self) {
+        // This function still updates the current epoch since that gives other
+        // threads more opportunities to advance the epoch - a thread which spends
+        // much of it's time alive BUT never advances the epoch could be problematic
+        self._enter(false);
+    }
+
+    /// Enter a critical section and returns whether GC happened.
+    ///
+    /// This method is reentrant, allowing for nested critical sections.
+    pub fn enter(&self) -> bool{
+        self._enter(true)
+    }
+
+    /// Actually enters the critical section
+    #[inline(always)]
+    fn _enter(&self, do_gc: bool) -> bool {
         let new_count = self.in_critical.load(Relaxed) + 1;
         self.in_critical.store(new_count, Relaxed);
-        if new_count > 1 { return }
+        if new_count > 1 { return false}
 
         atomic::fence(SeqCst);
 
         let global_epoch = global::get().epoch.load(Relaxed);
         if global_epoch != self.epoch.load(Relaxed) {
             self.epoch.store(global_epoch, Relaxed);
-            unsafe { (*self.garbage.get()).collect(); }
+            if do_gc {
+                unsafe { (*self.garbage.get()).collect(); }
+                return true
+            }
         }
+        false
     }
 
     /// Exit the current (nested) critical section.

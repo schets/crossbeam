@@ -128,16 +128,20 @@
 
 use std::marker::PhantomData;
 use std::marker;
+use std::cell::Cell;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::atomic::{self, Ordering};
+use std::sync::atomic::Ordering::{Relaxed};
 
 mod participant;
 mod participants;
 mod global;
 mod local;
 mod garbage;
+
+use mem::epoch::participant::Participant;
 
 /// Like `Box<T>`: an owned, heap-allocated data value of type `T`.
 pub struct Owned<T> {
@@ -385,6 +389,98 @@ impl<T> Atomic<T> {
     }
 }
 
+/// An RAII-style guard for tempoarily disables (or re-enabling) the gc
+///
+/// A user may want to define sections in which performing a GC
+/// is disabled - there may be a latency-critical section,
+/// a group of operations must be wait/lock free,
+/// one wants to delay deallocation to a later period, etc
+/// This feature allows that to happen in a defined scope,
+/// and also allows re-enabling (and re-disabling, and re-re-enabling,)
+/// of the gc.
+#[must_use]
+pub struct GCControl<'a> {
+    /// Stores whether gc was previously enabled or not
+    previous: bool,
+    /// Make this immovable
+    _nomove: Cell<Option<&'a bool>>,
+}
+
+impl<'a> GCControl<'a> {
+    fn _lock(&'a self) {
+        self._nomove.set(Some(&self.previous))
+    }
+}
+
+impl<'a> Drop for GCControl<'a> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        local::with_participant(|p| {
+            p.try_gc.store(self.previous, Relaxed)
+        })
+    }
+}
+
+/// This returns a variable determining whether the GC is enabled or not
+#[inline(always)]
+pub fn is_gc_enabled() -> bool {
+    local::with_participant(|p| {
+        p.try_gc.load(Relaxed)
+    })
+}
+
+#[inline(always)]
+pub fn __get_gc_guard_for<'a>(turn_on: bool) -> GCControl<'a> {
+    local::with_participant(|p| {
+        let gcc = GCControl {
+            previous: p.try_gc.load(Relaxed),
+            _nomove: Cell::new(None),
+        };
+        p.try_gc.store(turn_on, Relaxed);
+        gcc
+    })
+}
+
+macro_rules! _set_gc_scope {($x:expr, $code:block) => ({
+    let _temp_guard = __get_gc_guard_for($x);
+    _temp_guard._lock();
+    $code
+})}
+
+/// Sets the gc in the given scope
+///
+/// First parameter must evaluate to a boolean
+#[macro_export]
+macro_rules! set_gc_scope {
+    ($x:expr, $code:expr) => ({
+        let _temp_guard = __get_gc_guard_for($x);
+        $code
+    }
+    )}
+
+// Would a strong sense of disabling be usefull
+// So that someone can override a library enabling GC willy-nilly?
+
+/// Disables gc in the given scope
+///
+/// Allows disabling GC in a scope, useful for latency sensitive
+/// code. Be careful when performing writes in this scope - it's good to let
+/// garbage get collected at some point
+#[macro_export]
+macro_rules! disable_gc_scope {
+    ($code:expr) => (set_gc_scope!(false, $code));
+}
+
+/// Enables the gc in the given scope
+///
+/// Allows enabling the gc in a scope - library writers be careful -
+/// this *will* override disable_gc scopes from a user.
+#[macro_export]
+macro_rules! enable_gc_scope {
+    ($code:expr) => (set_gc_scope!(true, $code));
+}
+
+
 /// An RAII-style guard for pinning the current epoch.
 ///
 /// A guard must be acquired before most operations on an `Atomic` pointer. On
@@ -394,7 +490,46 @@ pub struct Guard {
     _marker: marker::PhantomData<*mut ()>, // !Send and !Sync
 }
 
-static GC_THRESH: usize = 32;
+/// Threshold for automatically advancing the epoch
+const GC_THRESH: usize = 32;
+
+/// Threshold for moving garbage to global when GC is disabled
+const GC_MIGRATE_THRESH: usize = GC_THRESH * 4;
+
+/// Tries the garbage collector, returns whether global and local GC ran
+///
+/// If the GC is disabled, returns None
+#[inline(always)]
+pub fn try_gc() -> Option<(bool, bool)> {
+    _run_gc(true)
+}
+
+/// Tries the local collector only, does not advance the epoch
+///
+/// If the gc is disabled, returns None
+#[inline(always)]
+pub fn try_local_gc() -> Option<bool> {
+    _run_gc(false).map(|rv| rv.1)
+}
+
+/// Runs the gc, globally/locally and forced/unforced
+fn _run_gc(global: bool) -> Option<(bool, bool)> {
+    local::with_participant(|p| {
+        if p.try_gc.load(Relaxed) {
+            let did_local = p.enter();
+
+            let g = Guard {
+                _marker: marker::PhantomData,
+            };
+
+            if global {
+                return Some((did_local, p.try_collect(&g)));
+            }
+            return Some((did_local, false))
+        }
+        None
+    })
+}
 
 /// Pin the current epoch.
 ///
@@ -403,21 +538,66 @@ static GC_THRESH: usize = 32;
 /// expensive. It is rentrant -- you can safely acquire nested guards, and only
 /// the first guard requires a barrier. Thus, in cases where you expect to
 /// perform several lock-free operations in quick succession, you may consider
-/// pinning around the entire set of operations.
+/// pinning around the entire set of operations. If gc is locally enabled,
+/// this may perform a garbage collection. Otherwise, it may attempt to
+/// migrate garbage
+#[inline(always)]
 pub fn pin() -> Guard {
     local::with_participant(|p| {
-        p.enter();
-
-        let g = Guard {
-            _marker: marker::PhantomData,
-        };
-
-        if p.garbage_size() > GC_THRESH {
-            p.try_collect(&g);
-        }
-
-        g
+        if p.try_gc.load(Relaxed) { _pin_gc(p) } else { _pin_nogc(p, false) }
     })
+}
+
+/// Pins the current epoch but doesn't attempt to collect garbage.
+///
+/// Useful for read-only operations or for avoiding gc
+/// in what needs to be a lock/wait free operation, or
+/// latency sensitive operations. This call will not gc even
+/// if gc is locally enabled, but it will eventually
+/// migrate garbage to the global scope which allocates and is lockfree
+#[inline(always)]
+pub fn pin_nogc() -> Guard {
+    local::with_participant(|p| _pin_nogc(p, false))
+}
+
+/// Pins the current epoch but doesn't attempt to collect or migrate garbage.
+///
+/// Useful for read-only operations or for avoiding gc
+/// in what needs to be a wait free operation, or
+/// latency sensitive operations. This call will not gc even
+/// if gc is locally enabled, and will never migrate garbage.
+/// Be very careful using pin_waitfree on a function call
+/// that unlinks data, and consider pin_nogc on anything that's
+/// only lockfree or already allocates
+#[inline(always)]
+pub fn pin_waitfree() -> Guard {
+    local::with_participant(|p| _pin_nogc(p, true))
+}
+
+fn _pin_gc(p: &Participant) -> Guard {
+    p.enter();
+
+    let g = Guard {
+        _marker: marker::PhantomData,
+    };
+
+    if p.garbage_size() > GC_THRESH {
+        p.try_collect(&g);
+    }
+
+    g
+}
+
+pub fn _pin_nogc(p: &Participant, waitfree: bool) -> Guard {
+    p.enter_nogc();
+
+    if !waitfree && p.garbage_size() > GC_MIGRATE_THRESH {
+        p.migrate_garbage();
+    }
+
+    Guard {
+        _marker: marker::PhantomData,
+    }
 }
 
 impl Guard {
@@ -468,5 +648,62 @@ mod test {
         unsafe {
             assert_eq!(DROPS, 0);
         }
+    }
+
+    #[test]
+    fn test_no_drop_nogc() {
+        static mut DROPS: i32 = 0;
+        struct Test;
+        impl Drop for Test {
+            fn drop(&mut self) {
+                unsafe {
+                    DROPS += 1;
+                }
+            }
+        }
+        let g = pin_nogc();
+
+        let x = Atomic::null();
+        x.store(Some(Owned::new(Test)), Ordering::Relaxed);
+        x.store_and_ref(Owned::new(Test), Ordering::Relaxed, &g);
+        let y = x.load(Ordering::Relaxed, &g);
+        let z = x.cas_and_ref(y, Owned::new(Test), Ordering::Relaxed, &g).ok();
+        let _ = x.cas(z, Some(Owned::new(Test)), Ordering::Relaxed);
+        x.swap(Some(Owned::new(Test)), Ordering::Relaxed, &g);
+
+        unsafe {
+            assert_eq!(DROPS, 0);
+        }
+    }
+
+    #[test]
+    fn test_gc_default_enable() {
+        assert_eq!(is_gc_enabled(), true);
+    }
+
+    #[test]
+    fn test_gc_disable() {
+        assert_eq!(is_gc_enabled(), true);
+        disable_gc_scope! {
+            assert_eq!(is_gc_enabled(), false)
+        }
+        assert_eq!(is_gc_enabled(), true);
+    }
+
+    #[test]
+    fn test_gc_control_scope() {
+        disable_gc_scope!{{
+            assert_eq!(is_gc_enabled(), false);
+            enable_gc_scope! {{
+                assert_eq!(is_gc_enabled(), true);
+                disable_gc_scope! {
+                    assert_eq!(is_gc_enabled(), false)
+                }
+                assert_eq!(is_gc_enabled(), true);
+            }}
+            assert_eq!(is_gc_enabled(), false);
+        }}
+        assert_eq!(is_gc_enabled(), true);
+
     }
 }
