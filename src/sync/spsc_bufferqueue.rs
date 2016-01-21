@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering::{Acquire, Release, Relaxed, AcqRel};
 use std::sync::atomic::{AtomicUsize, AtomicBool, fence};
+use std::sync::mpsc::{TrySendError, TryRecvError};
 use std::sync::Arc;
 use std::ptr;
 use std::mem;
@@ -77,8 +78,11 @@ impl<T: Send> SpscBufferQueue<T> {
         rtuple
     }
 
+    // This uses a similar api to the mps channel
+
     /// Performs the actual push
-    fn try_construct<F>(&self, ctor: F) -> Option<F>
+    #[inline(always)]
+    fn try_construct<F>(&self, ctor: F) -> Result<(), TrySendError<F>>
                   where F: FnOnce() -> T {
         let ctail = self.tail.load(Relaxed);
         let mut next_tail = ctail + 1;
@@ -87,7 +91,7 @@ impl<T: Send> SpscBufferQueue<T> {
             let cur_head = self.head.load(Acquire);
             self.head_cache.store(cur_head, Relaxed);
             if next_tail == cur_head {
-                return Some(ctor);
+                return Err(ctor);
             }
         }
         unsafe {
@@ -96,16 +100,16 @@ impl<T: Send> SpscBufferQueue<T> {
             ptr::write(data_pos, ctor());
         }
         self.tail.store(next_tail, Release);
-        None
+        OK(())
     }
 
     /// Tries pushing the element onto the queue, returns value on failure
     #[inline(always)]
-    pub fn try_push(&self, val: T) -> Option<T> {
-        self.try_construct(|| val).map(|f| f())
+    pub fn try_push(&self, val: T) -> Result<(), T> {
+        self.try_construct(|| val).map_err(|f| f.0())
     }
 
-    pub fn try_pop(&self) -> Option<T> {
+    pub fn try_pop(&self) -> Result<() {
         let chead = self.head.load(Relaxed);
         if chead == self.tail_cache.load(Relaxed) {
             let cur_tail = self.tail.load(Acquire);
