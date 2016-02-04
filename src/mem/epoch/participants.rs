@@ -5,6 +5,7 @@
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering::{Relaxed, Acquire, Release};
+use std::sync::atomic::fence;
 
 use mem::epoch::{Atomic, Owned, Guard};
 use mem::epoch::participant::Participant;
@@ -50,13 +51,27 @@ impl Participants {
     /// Enroll a new thread in epoch management by adding a new `Particpant`
     /// record to the global list.
     pub fn enroll(&self) -> *const Participant {
-        let mut participant = Owned::new(ParticipantNode::new());
 
         // we ultimately use epoch tracking to free Participant nodes, but we
         // can't actually enter an epoch here, so fake it; we know the node
         // can't be removed until marked inactive anyway.
         let fake_guard = ();
         let g: &'static Guard = unsafe { mem::transmute(&fake_guard) };
+
+        let mut count = 0;
+
+        for p in self.iter(g) {
+            if !p.active.load(Relaxed) {
+                fence(Acquire);
+                return p;
+            }
+            count += 1;
+            if count >= 100 {
+                break;
+            }
+        }
+
+        let mut participant = Owned::new(ParticipantNode::new());
         loop {
             let head = self.head.load(Relaxed, g);
             participant.next.store_shared(head, Relaxed);
