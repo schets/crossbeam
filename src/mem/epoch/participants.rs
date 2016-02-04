@@ -4,16 +4,16 @@
 
 use std::mem;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::Ordering::{Relaxed, Acquire, Release};
-use std::sync::atomic::fence;
-
+use std::sync::atomic::Ordering::{Relaxed, Acquire, Release, SeqCst};
+use std::sync::atomic::{AtomicBool, fence};
 use mem::epoch::{Atomic, Owned, Guard};
 use mem::epoch::participant::Participant;
 use mem::CachePadded;
 
 /// Global, threadsafe list of threads participating in epoch management.
 pub struct Participants {
-    head: Atomic<ParticipantNode>
+    head: Atomic<ParticipantNode>,
+    writable: AtomicBool,
 }
 
 pub struct ParticipantNode(CachePadded<Participant>);
@@ -40,13 +40,19 @@ impl DerefMut for ParticipantNode {
 impl Participants {
     #[cfg(not(feature = "nightly"))]
     pub fn new() -> Participants {
-        Participants { head: Atomic::null() }
+        Participants {
+            head: Atomic::null(),
+            writable: AtomicBool::new(false),
+        }
     }
 
     #[cfg(feature = "nightly")]
     pub const fn new() -> Participants {
-        Participants { head: Atomic::null() }
-    }
+        Participants {
+            head: Atomic::null(),
+            writable: AtomicBool::new(false),
+        }
+   }
 
     /// Enroll a new thread in epoch management by adding a new `Particpant`
     /// record to the global list.
@@ -58,20 +64,6 @@ impl Participants {
         // can't be removed until marked inactive anyway.
         let fake_guard = ();
         let g: &'static Guard = unsafe { mem::transmute(&fake_guard) };
-
-        let mut count = 0;
-
-        for p in self.iter(g) {
-            if !p.active.load(Relaxed) {
-                fence(Acquire);
-                return p;
-            }
-            count += 1;
-            if count >= 100 {
-                break;
-            }
-        }
-
         loop {
             let head = self.head.load(Relaxed, g);
             participant.next.store_shared(head, Relaxed);
@@ -91,7 +83,9 @@ impl Participants {
         Iter {
             guard: g,
             next: &self.head,
-            needs_acq: true,
+            is_first: true,
+            writable: &self.writable,
+            can_write: false,
         }
     }
 }
@@ -103,14 +97,21 @@ pub struct Iter<'a> {
 
     // an Acquire read is needed only for the first read, due to release
     // sequences
-    needs_acq: bool,
+    is_first: bool,
+
+    // The boolean lock variable
+    writable: &'a AtomicBool,
+
+    // Does this iterator have write privlidges
+    can_write: bool,
 }
 
 impl<'a> Iterator for Iter<'a> {
     type Item = &'a Participant;
     fn next(&mut self) -> Option<&'a Participant> {
-        let mut cur = if self.needs_acq {
-            self.needs_acq = false;
+        let was_first = self.is_first;
+        let mut cur = if self.is_first {
+            self.is_first = false;
             self.next.load(Acquire, self.guard)
         } else {
             self.next.load(Relaxed, self.guard)
@@ -119,14 +120,39 @@ impl<'a> Iterator for Iter<'a> {
         while let Some(n) = cur {
             // attempt to clean up inactive nodes
             if !n.active.load(Relaxed) {
+                fence(Acquire);
                 cur = n.next.load(Relaxed, self.guard);
-                // TODO: actually reclaim inactive participants!
+
+                // Don't write to first since there are always many appenders
+                if !was_first {
+                    if !self.can_write {
+                        //sanity check to avoid pointless cas
+                        if self.writable.load(Relaxed) {
+                            continue;
+                        }
+                        // gain write properties
+                        // keep them since this thread likely to see rest of inactives
+                        self.can_write = !self.writable.compare_and_swap(false, true, Relaxed);
+
+                        if !self.can_write {
+                            continue;
+                        }
+                    }
+
+                    // Unlink the node! No cas shenanigans since we are only deleter
+                    self.next.store_shared(cur, SeqCst);
+                    unsafe { self.guard.unlinked(n); }
+                }
+
             } else {
                 self.next = &n.next;
                 return Some(&n)
             }
         }
 
+        if self.can_write {
+            self.writable.store(false, Release);
+        }
         None
     }
 }
