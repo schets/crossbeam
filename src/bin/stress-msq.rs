@@ -9,9 +9,9 @@ const DUP: usize = 4;
 const THREADS: u32 = 2;
 const COUNT: u64 = 100000;
 const EXTRA_COUNT: u64 = 130;
-const EXTRA_THREAD: u64 = 50;
+const EXTRA_THREAD: u64 = 20;
 
-fn main() {
+fn _main() {
     scope(|s| {
         for _i in 0..DUP {
             let q = Arc::new(MsQueue::new());
@@ -50,4 +50,10 @@ fn main() {
             }
         }
     });
+}
+
+fn main() {
+    loop {
+        _main();
+    }
 }
