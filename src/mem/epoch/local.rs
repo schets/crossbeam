@@ -1,6 +1,6 @@
 // Manage the thread-local state, providing access to a `Participant` record.
 
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::Release;
 
 use mem::epoch::participant::Participant;
 use mem::epoch::global;
@@ -22,7 +22,7 @@ impl LocalEpoch {
 // FIXME: avoid leaking when all threads have exited
 impl Drop for LocalEpoch {
     fn drop(&mut self) {
-        self.get().active.store(false, Relaxed);
+        self.get().active.store(false, Release);
     }
 }
 
