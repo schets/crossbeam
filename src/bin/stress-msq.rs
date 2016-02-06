@@ -4,14 +4,26 @@ use crossbeam::sync::MsQueue;
 use crossbeam::scope;
 
 use std::sync::Arc;
+// I know no better way in rust to prevent loop elimination
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 
 const DUP: usize = 4;
 const THREADS: u32 = 2;
+<<<<<<< HEAD
 const COUNT: u64 = 10000;
 const EXTRA_COUNT: u64 = 20;
 const EXTRA_THREAD: u64 = 50;
 
 fn _main() {
+=======
+const COUNT: u64 = 100000;
+const THREADLOOP: u64 = 500;
+const THREADCOUNT: u64 = 50;
+
+
+fn main() {
+    let DUMMY = AtomicBool::new(false);
+>>>>>>> a406fda5df48459a298a32d6ae8c583815275532
     scope(|s| {
         for _i in 0..DUP {
             let q = Arc::new(MsQueue::new());
