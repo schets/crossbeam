@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 const DUP: usize = 4;
 const THREADS: u32 = 2;
-const COUNT: u64 = 100000;
-const EXTRA_COUNT: u64 = 130;
-const EXTRA_THREAD: u64 = 20;
+const COUNT: u64 = 10000;
+const EXTRA_COUNT: u64 = 20;
+const EXTRA_THREAD: u64 = 50;
 
 fn _main() {
     scope(|s| {
