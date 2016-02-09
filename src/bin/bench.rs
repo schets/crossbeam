@@ -1,6 +1,6 @@
 #![cfg_attr(feature = "nightly",
             feature(duration_span))]
-
+#![feature(duration_span)]
 extern crate crossbeam;
 
 use std::collections::VecDeque;
@@ -12,21 +12,33 @@ use crossbeam::scope;
 use crossbeam::sync::MsQueue;
 use crossbeam::sync::SegQueue;
 
+use std::sync::atomic::AtomicPtr;
+
 use extra_impls::mpsc_queue::Queue as MpscQueue;
 
 mod extra_impls;
 
-const COUNT: u64 = 10000000;
-const THREADS: u64 = 2;
+use std::mem;
 
-#[cfg(feature = "nightly")]
-fn time<F: FnOnce()>(f: F) -> Duration {
-    Duration::span(f)
+const COUNT: u64 = 10000000;
+const THREADS: u64 = 1;
+
+struct dummy {
+    vals: Box<[usize; 8]>,
+    pub good: bool,
 }
 
-#[cfg(not(feature = "nightly"))]
-fn time<F: FnOnce()>(_f: F) -> Duration {
-    Duration::new(0, 0)
+impl dummy {
+    pub fn new(g: bool) -> dummy {
+        dummy {
+            vals: Box::new([0; 8]),
+            good: g,
+        }
+    }
+}
+
+fn time<F: FnOnce()>(f: F) -> Duration {
+    Duration::span(f)
 }
 
 fn nanos(d: Duration) -> f64 {
@@ -37,6 +49,7 @@ trait Queue<T> {
     fn push(&self, T);
     fn try_pop(&self) -> Option<T>;
 }
+
 
 impl<T> Queue<T> for MsQueue<T> {
     fn push(&self, t: T) { self.push(t) }
@@ -68,14 +81,14 @@ impl<T> Queue<T> for Mutex<VecDeque<T>> {
     fn try_pop(&self) -> Option<T> { self.lock().unwrap().pop_front() }
 }
 
-fn bench_queue_mpsc<Q: Queue<u64> + Sync>(q: Q) -> f64 {
+fn bench_queue_mpsc<Q: Queue<dummy> + Sync>(q: Q) -> f64 {
     let d = time(|| {
         scope(|scope| {
             for _i in 0..THREADS {
                 let qr = &q;
                 scope.spawn(move || {
                     for x in 0..COUNT {
-                        let _ = qr.push(x);
+                        let _ = qr.push(dummy::new(true));
                     }
                 });
             }
@@ -92,7 +105,7 @@ fn bench_queue_mpsc<Q: Queue<u64> + Sync>(q: Q) -> f64 {
     nanos(d) / ((COUNT * THREADS) as f64)
 }
 
-fn bench_queue_mpmc<Q: Queue<bool> + Sync>(q: Q) -> f64 {
+fn bench_queue_mpmc<Q: Queue<dummy> + Sync>(q: Q) -> f64 {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -105,17 +118,19 @@ fn bench_queue_mpmc<Q: Queue<bool> + Sync>(q: Q) -> f64 {
                 let pcr = &prod_count;
                 scope.spawn(move || {
                     for _x in 0..COUNT {
-                        qr.push(true);
+                        qr.push(dummy::new(true));
                     }
                     if pcr.fetch_add(1, Relaxed) == (THREADS as usize) - 1 {
                         for _x in 0..THREADS {
-                            qr.push(false)
+                            qr.push(dummy::new(false))
                         }
                     }
                 });
                 scope.spawn(move || {
                     loop {
-                        if let Some(false) = qr.try_pop() { break }
+                        if let Some(x) = qr.try_pop() {
+                            if !x.good {break}
+                        }
                     }
                 });
             }
