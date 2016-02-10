@@ -102,21 +102,19 @@ impl<T> SegQueue<T> {
                 self.tail.store_shared(Some(tail), Release);
             }
             let topush = if j + try_to_push > SEG_SIZE {
-SEG_SIZE - j} else {try_to_push};
+                SEG_SIZE - j
+            } else {
+                try_to_push
+            };
             elems_left -= topush;
             // Theres an arm optimization here,
             // where we batch data writes, then have a single release fence,
             // then batch ready writes.
             for e in j..(j + topush) {
                 unsafe {
-match i.next() {
-Some(val) => {
                     let cell = (*tail).data.get_unchecked(e).get();
-                    ptr::write(&mut (*cell).0, val);
+                    ptr::write(&mut (*cell).0, i.next().unwrap());
                     (*cell).1.store(true, Release);
-},
-None => {println!("Broke with elems_left of {} and try of {}", elems_left, e-j); return ()},
-}
                 }
             }
         }
