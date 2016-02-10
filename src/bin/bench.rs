@@ -1,12 +1,14 @@
 #![cfg_attr(feature = "nightly",
             feature(duration_span))]
 
+#![feature(duration_span)]
 extern crate crossbeam;
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::mpsc::channel;
 use std::time::Duration;
+use std::iter;
 
 use crossbeam::scope;
 use crossbeam::sync::MsQueue;
@@ -16,18 +18,13 @@ use extra_impls::mpsc_queue::Queue as MpscQueue;
 
 mod extra_impls;
 
-const COUNT: u64 = 10000000;
-const THREADS: u64 = 2;
+const COUNT: usize = 10000000;
+const THREADS: usize = 2;
 
-#[cfg(feature = "nightly")]
 fn time<F: FnOnce()>(f: F) -> Duration {
     Duration::span(f)
 }
 
-#[cfg(not(feature = "nightly"))]
-fn time<F: FnOnce()>(_f: F) -> Duration {
-    Duration::new(0, 0)
-}
 
 fn nanos(d: Duration) -> f64 {
     d.as_secs() as f64 * 1000000000f64 + (d.subsec_nanos() as f64)
@@ -35,21 +32,35 @@ fn nanos(d: Duration) -> f64 {
 
 trait Queue<T> {
     fn push(&self, T);
+    fn push_bulk<I: ExactSizeIterator<Item=T>>(&self, i: &mut I);
     fn try_pop(&self) -> Option<T>;
 }
 
 impl<T> Queue<T> for MsQueue<T> {
     fn push(&self, t: T) { self.push(t) }
+    fn push_bulk<I: ExactSizeIterator<Item=T>>(&self, i: &mut I) {
+        for v in i {
+            self.push(v);
+        }
+    }
     fn try_pop(&self) -> Option<T> { self.try_pop() }
 }
 
 impl<T> Queue<T> for SegQueue<T> {
     fn push(&self, t: T) { self.push(t) }
+    fn push_bulk<I: ExactSizeIterator<Item=T>>(&self, i: &mut I) {
+        self.push_bulk(i);
+    }
     fn try_pop(&self) -> Option<T> { self.try_pop() }
 }
 
 impl<T> Queue<T> for MpscQueue<T> {
     fn push(&self, t: T) { self.push(t) }
+    fn push_bulk<I: ExactSizeIterator<Item=T>>(&self, i: &mut I) {
+        for v in i {
+            self.push(v);
+        }
+    }
     fn try_pop(&self) -> Option<T> {
         use extra_impls::mpsc_queue::*;
 
@@ -65,18 +76,22 @@ impl<T> Queue<T> for MpscQueue<T> {
 
 impl<T> Queue<T> for Mutex<VecDeque<T>> {
     fn push(&self, t: T) { self.lock().unwrap().push_back(t) }
+    fn push_bulk<I: ExactSizeIterator<Item=T>>(&self, i: &mut I) {
+        for v in i {
+            self.push(v);
+        }
+    }
     fn try_pop(&self) -> Option<T> { self.lock().unwrap().pop_front() }
 }
 
-fn bench_queue_mpsc<Q: Queue<u64> + Sync>(q: Q) -> f64 {
+fn bench_queue_mpsc<Q: Queue<usize> + Sync>(q: Q) -> f64 {
     let d = time(|| {
         scope(|scope| {
             for _i in 0..THREADS {
                 let qr = &q;
                 scope.spawn(move || {
-                    for x in 0..COUNT {
-                        let _ = qr.push(x);
-                    }
+                    let mut numbers = 0..COUNT;
+                    qr.push_bulk(&mut numbers);
                 });
             }
 
@@ -104,9 +119,8 @@ fn bench_queue_mpmc<Q: Queue<bool> + Sync>(q: Q) -> f64 {
                 let qr = &q;
                 let pcr = &prod_count;
                 scope.spawn(move || {
-                    for _x in 0..COUNT {
-                        qr.push(true);
-                    }
+                    let mut x = (0..COUNT).map(|_x| true);
+                    qr.push_bulk(&mut x);
                     if pcr.fetch_add(1, Relaxed) == (THREADS as usize) - 1 {
                         for _x in 0..THREADS {
                             qr.push(false)

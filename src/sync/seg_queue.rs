@@ -4,7 +4,7 @@ use std::{ptr, mem};
 use std::cmp;
 use std::cell::UnsafeCell;
 
-use mem::epoch::{self, Atomic, Owned};
+use mem::epoch::{self, Atomic, Owned, Guard};
 
 const SEG_SIZE: usize = 32;
 
@@ -76,6 +76,41 @@ impl<T> SegQueue<T> {
                     }
 
                     return
+                }
+            }
+        }
+    }
+
+    /// Pushes all elements contained in the iterator to the back of the queue
+    ///
+    /// It's advised that this iterator shouldn't do too much heavy lifting
+    /// between successful yields otherwise memory reclamation will be delayed
+    #[inline(always)]
+    pub fn push_bulk<I: ExactSizeIterator>(&self, i: &mut I) where I: ExactSizeIterator<Item=T> {
+        let mut elems_left = i.len();
+        loop {
+            let guard = epoch::pin();
+            let try_to_push = cmp::min(elems_left, SEG_SIZE/2);
+            let tail = self.tail.load(Acquire, &guard).unwrap();
+            if tail.high.load(Relaxed) >= SEG_SIZE { continue }
+            let j = tail.high.fetch_add(try_to_push, Relaxed);
+            if j >= SEG_SIZE { continue }
+            // Update the tail prior to pushing new elements
+            // so that other can continue while we write
+            if j + try_to_push >= SEG_SIZE {
+                let tail = tail.next.store_and_ref(Owned::new(Segment::new()), Release, &guard);
+                self.tail.store_shared(Some(tail), Release);
+            }
+            let topush = SEG_SIZE - j;
+            elems_left -= topush;
+            // Theres an arm optimization here,
+            // where we batch data writes, then have a single release fence,
+            // then batch ready writes.
+            for e in j..(j + topush) {
+                unsafe {
+                    let cell = (*tail).data.get_unchecked(e).get();
+                    ptr::write(&mut (*cell).0, i.next().unwrap());
+                    (*cell).1.store(true, Release);
                 }
             }
         }
