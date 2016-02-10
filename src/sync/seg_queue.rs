@@ -88,7 +88,7 @@ impl<T> SegQueue<T> {
     #[inline(always)]
     pub fn push_bulk<I: ExactSizeIterator>(&self, i: &mut I) where I: ExactSizeIterator<Item=T> {
         let mut elems_left = i.len();
-        loop {
+        while elems_left > 0 {
             let guard = epoch::pin();
             let try_to_push = cmp::min(elems_left, SEG_SIZE/2);
             let tail = self.tail.load(Acquire, &guard).unwrap();
@@ -101,16 +101,22 @@ impl<T> SegQueue<T> {
                 let tail = tail.next.store_and_ref(Owned::new(Segment::new()), Release, &guard);
                 self.tail.store_shared(Some(tail), Release);
             }
-            let topush = SEG_SIZE - j;
+            let topush = if j + try_to_push > SEG_SIZE {
+SEG_SIZE - j} else {try_to_push};
             elems_left -= topush;
             // Theres an arm optimization here,
             // where we batch data writes, then have a single release fence,
             // then batch ready writes.
             for e in j..(j + topush) {
                 unsafe {
+match i.next() {
+Some(val) => {
                     let cell = (*tail).data.get_unchecked(e).get();
-                    ptr::write(&mut (*cell).0, i.next().unwrap());
+                    ptr::write(&mut (*cell).0, val);
                     (*cell).1.store(true, Release);
+},
+None => {println!("Broke with elems_left of {} and try of {}", elems_left, e-j); return ()},
+}
                 }
             }
         }

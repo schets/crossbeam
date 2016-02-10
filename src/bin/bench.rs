@@ -101,6 +101,7 @@ fn bench_queue_mpsc<Q: Queue<usize> + Sync>(q: Q) -> f64 {
                     count += 1;
                 }
             }
+println!("Popped!");
         });
     });
 
