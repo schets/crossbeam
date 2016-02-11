@@ -19,7 +19,7 @@ use extra_impls::mpsc_queue::Queue as MpscQueue;
 mod extra_impls;
 
 const COUNT: usize = 10000000;
-const THREADS: usize = 2;
+const THREADS: usize = 3;
 
 fn time<F: FnOnce()>(f: F) -> Duration {
     Duration::span(f)
@@ -49,7 +49,7 @@ impl<T> Queue<T> for MsQueue<T> {
 impl<T> Queue<T> for SegQueue<T> {
     fn push(&self, t: T) { self.push(t) }
     fn push_bulk<I: ExactSizeIterator<Item=T>>(&self, i: &mut I) {
-        self.push_bulk(i);
+        self.consume_directly(i);
     }
     fn try_pop(&self) -> Option<T> { self.try_pop() }
 }

@@ -5,6 +5,7 @@ use std::cmp;
 use std::cell::UnsafeCell;
 
 use mem::epoch::{self, Atomic, Owned, Guard};
+use sync::unsafe_array_iter::UnsafeArrayIter;
 
 const SEG_SIZE: usize = 32;
 
@@ -81,12 +82,14 @@ impl<T> SegQueue<T> {
         }
     }
 
-    /// Pushes all elements contained in the iterator to the back of the queue
+    /// Pushes all elements contained in the iterator directly into the queue
     ///
     /// It's advised that this iterator shouldn't do too much heavy lifting
     /// between successful yields otherwise memory reclamation will be delayed
+    /// because the iterator yields values inside of an epoch protected region
+    /// However, elements are availably immediately to consumers upon yielding
     #[inline(always)]
-    pub fn push_bulk<I: ExactSizeIterator>(&self, i: &mut I) where I: ExactSizeIterator<Item=T> {
+    pub fn consume_directly<I: ExactSizeIterator<Item=T>>(&self, mut i: I) {
         let mut elems_left = i.len();
         while elems_left > 0 {
             let guard = epoch::pin();
@@ -97,19 +100,18 @@ impl<T> SegQueue<T> {
             if j >= SEG_SIZE { continue }
             // Update the tail prior to pushing new elements
             // so that other can continue while we write
-            if j + try_to_push >= SEG_SIZE {
+            let topush = if j + try_to_push >= SEG_SIZE {
                 let tail = tail.next.store_and_ref(Owned::new(Segment::new()), Release, &guard);
                 self.tail.store_shared(Some(tail), Release);
-            }
-            let topush = if j + try_to_push > SEG_SIZE {
                 SEG_SIZE - j
             } else {
                 try_to_push
             };
             elems_left -= topush;
-            // Theres an arm optimization here,
+            // There's a potential arm/powerpc optimization here,
             // where we batch data writes, then have a single release fence,
-            // then batch ready writes.
+            // then batch ready writes. However, that means writes wouldn't
+            // be instantly available to consumers.
             for e in j..(j + topush) {
                 unsafe {
                     let cell = (*tail).data.get_unchecked(e).get();
@@ -117,6 +119,26 @@ impl<T> SegQueue<T> {
                     (*cell).1.store(true, Release);
                 }
             }
+        }
+    }
+
+    /// Bulk inserts the elements into the queue
+    ///
+    /// This doesn't hold the epoch while generating elements,
+    /// however elements are copied to a local buffer prior to insertion
+    /// so may incur a small cost for big enough items. For small items
+    /// (8-16 bytes) the cost is really small.
+    pub fn consume<I: Iterator<Item=T>>(&self, i: &mut I) {
+        loop {
+            let mut buffer: [T; 13] = unsafe { mem::uninitialized() };
+            let mut collected = 0;
+            for val in i.take(13) {
+                unsafe { ptr::write(&mut buffer[collected], val)};
+                collected += 1;
+            }
+            if collected == 0 { return; }
+            self.consume_directly(UnsafeArrayIter::new(&mut buffer, collected));
+            mem::forget(buffer);
         }
     }
 

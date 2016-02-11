@@ -9,4 +9,5 @@ mod atomic_option;
 mod ms_queue;
 mod treiber_stack;
 mod seg_queue;
+mod unsafe_array_iter;
 pub mod chase_lev;
