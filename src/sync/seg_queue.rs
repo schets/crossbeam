@@ -90,7 +90,14 @@ impl<T> SegQueue<T> {
             let head = self.head.load(Acquire, &guard).unwrap();
             loop {
                 let low = head.low.load(Relaxed);
-                if low >= cmp::min(head.high.load(Relaxed), SEG_SIZE) { break }
+                if low == SEG_SIZE {
+                    if head.next.load(Relaxed, &guard).is_none() {
+                        return None // at end and nothing's next yet
+                    }
+                    else {
+                        break // at end and something's next!
+                    }
+                }
                 unsafe {
                     let cell = (*head).data.get_unchecked(low).get();
                     // If the writer hasn't advanced this far, exit
@@ -108,7 +115,6 @@ impl<T> SegQueue<T> {
                     }
                 }
             }
-            if head.next.load(Relaxed, &guard).is_none() { return None }
         }
     }
 }
