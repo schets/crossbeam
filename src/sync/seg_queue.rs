@@ -91,12 +91,11 @@ impl<T> SegQueue<T> {
             loop {
                 let low = head.low.load(Relaxed);
                 if low >= cmp::min(head.high.load(Relaxed), SEG_SIZE) { break }
-                if head.low.compare_and_swap(low, low+1, Relaxed) == low {
-                    unsafe {
-                        let cell = (*head).data.get_unchecked(low).get();
-                        loop {
-                            if (*cell).1.load(Acquire) { break }
-                        }
+                unsafe {
+                    let cell = (*head).data.get_unchecked(low).get();
+                    // If the writer hasn't advanced this far, exit
+                    if !(*cell).1.load(Acquire) { return None }
+                    if head.low.compare_and_swap(low, low+1, Relaxed) == low {
                         if low + 1 == SEG_SIZE {
                             loop {
                                 if let Some(next) = head.next.load(Acquire, &guard) {
