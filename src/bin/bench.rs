@@ -1,6 +1,7 @@
 #![cfg_attr(feature = "nightly",
             feature(duration_span))]
 
+#![feature(duration_span)]
 extern crate crossbeam;
 
 use std::collections::VecDeque;
@@ -11,22 +12,18 @@ use std::time::Duration;
 use crossbeam::scope;
 use crossbeam::sync::MsQueue;
 use crossbeam::sync::SegQueue;
+use crossbeam::sync::SegSpmc;
 
 use extra_impls::mpsc_queue::Queue as MpscQueue;
 
 mod extra_impls;
 
 const COUNT: u64 = 10000000;
-const THREADS: u64 = 2;
+const THREADS: u64 = 3;
 
-#[cfg(feature = "nightly")]
+//#[cfg(feature = "nightly")]
 fn time<F: FnOnce()>(f: F) -> Duration {
     Duration::span(f)
-}
-
-#[cfg(not(feature = "nightly"))]
-fn time<F: FnOnce()>(_f: F) -> Duration {
-    Duration::new(0, 0)
 }
 
 fn nanos(d: Duration) -> f64 {
@@ -44,6 +41,11 @@ impl<T> Queue<T> for MsQueue<T> {
 }
 
 impl<T> Queue<T> for SegQueue<T> {
+    fn push(&self, t: T) { self.push(t) }
+    fn try_pop(&self) -> Option<T> { self.try_pop() }
+}
+
+impl<T> Queue<T> for SegSpmc<T> {
     fn push(&self, t: T) { self.push(t) }
     fn try_pop(&self) -> Option<T> { self.try_pop() }
 }
@@ -127,6 +129,37 @@ fn bench_queue_mpmc<Q: Queue<bool> + Sync>(q: Q) -> f64 {
     nanos(d) / ((COUNT * THREADS) as f64)
 }
 
+fn bench_queue_spmc<Q: Queue<bool> + Sync>(q: Q) -> f64 {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let prod_count = AtomicUsize::new(0);
+
+    let d = time(|| {
+        scope(|scope| {
+            for _i in 0..THREADS {
+                let qr = &q;
+                let pcr = &prod_count;
+                scope.spawn(move || {
+                    loop {
+                        if let Some(false) = qr.try_pop() {
+                            break;
+                        }
+                    }
+                });
+            }
+            for i in 0..(COUNT*THREADS) {
+                q.push(true);
+            }
+            for i in 0..THREADS {
+                q.push(false);
+            }
+        });
+    });
+
+    nanos(d) / ((COUNT * THREADS) as f64)
+}
+
 fn bench_chan_mpsc() -> f64 {
     let (tx, rx) = channel();
 
@@ -159,6 +192,10 @@ fn main() {
 
     println!("MSQ mpmc: {}", bench_queue_mpmc(MsQueue::new()));
     println!("Seg mpmc: {}", bench_queue_mpmc(SegQueue::new()));
+
+    println!("MSQ spmc: {}", bench_queue_spmc(MsQueue::new()));
+    println!("SegQueue spmc: {}", bench_queue_spmc(SegQueue::new()));
+    println!("SegSpmc spmc: {}", bench_queue_spmc(SegSpmc::new()));
 
 //    println!("queue_mpsc: {}", bench_queue_mpsc());
 //    println!("queue_mpmc: {}", bench_queue_mpmc());

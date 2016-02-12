@@ -399,6 +399,7 @@ impl<T> Atomic<T> {
 #[must_use]
 pub struct Guard {
     _marker: marker::PhantomData<*mut ()>, // !Send and !Sync
+    is_real: bool,
 }
 
 /// Pin the current epoch.
@@ -415,6 +416,7 @@ pub fn pin() -> Guard {
 
         let g = Guard {
             _marker: marker::PhantomData,
+            is_real: true,
         };
 
         if p.should_gc() {
@@ -423,6 +425,17 @@ pub fn pin() -> Guard {
 
         g
     })
+}
+
+/// Generates a guard without pinning the current epoch
+///
+/// This is unsafe! It's useful for single writer data structures,
+/// or something where there are guaruntees
+pub unsafe fn fake_pin() -> Guard {
+    Guard {
+        _marker: marker::PhantomData,
+        is_real: false,
+    }
 }
 
 impl Guard {
@@ -436,11 +449,26 @@ impl Guard {
     pub fn migrate_garbage(&self) {
         local::with_participant(|p| p.migrate_garbage())
     }
+
+    pub fn pin(&mut self) {
+        if !self.is_real {
+            self.is_real = true;
+            local::with_participant(|p| {
+                p.enter();
+
+                if p.should_gc() {
+                    p.try_collect(self);
+                }
+            });
+        }
+    }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        local::with_participant(|p| p.exit());
+        if self.is_real {
+            local::with_participant(|p| p.exit());
+        }
     }
 }
 
