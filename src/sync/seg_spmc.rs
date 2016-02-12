@@ -1,12 +1,12 @@
 use std::sync::atomic::Ordering::{Acquire, Release, Relaxed};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 use std::{ptr, mem};
 use std::cmp;
 use std::cell::UnsafeCell;
 
-use mem::epoch::{self, Atomic, Owned};
+use mem::epoch::{self, Atomic, Owned, Shared, Guard};
 
-const SEG_SIZE: usize = 32;
+const SEG_SIZE: usize = 256;
 
 /// A spmc queue that allocates "segments" (arrays of nodes)
 /// for efficiency.
@@ -80,18 +80,27 @@ impl<T> SegSpmc<T> {
         }
     }
 
+    fn try_advance_head(&self, head: Shared<Segment<T>>, guard: &Guard) {
+        if let Some(next) = head.next.load(Acquire, &guard) {
+            if head.as_raw() == self.head.load(Relaxed, &guard).unwrap().as_raw() {
+                if self.head.cas_shared(Some(head), Some(next), Release) {
+                    unsafe { guard.unlinked(head) };
+                }
+            }
+        }
+    }
+
     /// Attempt to dequeue from the front.
     ///
     /// Returns `None` if the queue is observed to be empty.
     pub fn try_pop(&self) -> Option<T> {
-        let guard = epoch::pin();
         loop {
+            let guard = epoch::pin();
             let head = self.head.load(Acquire, &guard).unwrap();
             loop {
                 let curhigh = head.high.load(Relaxed);
                 let low = head.low.load(Relaxed);
-                if low >= SEG_SIZE { break; }
-                if low >= curhigh { continue; }
+                if low >= cmp::min(curhigh, SEG_SIZE) { break; }
                 // There's a version that uses fetch_add and should be faster
                 // but I can't get it to work...
                 let attempt = head.low.fetch_add(1, Acquire);
@@ -99,20 +108,19 @@ impl<T> SegSpmc<T> {
                     unsafe {
                         let cell = (*head).data.get_unchecked(attempt).get();
                         if attempt + 1 == SEG_SIZE {
-                            loop {
-                                if let Some(next) = head.next.load(Acquire, &guard) {
-                                    self.head.store_shared(Some(next), Release);
-                                    guard.unlinked(head);
-                                    break
-                                }
-                            }
+                            self.try_advance_head(head, &guard);
                         }
                         return Some(ptr::read(cell))
                     }
                 }
-                head.low.fetch_sub(1, Relaxed);
+                if curhigh < SEG_SIZE {
+                    head.low.fetch_sub(1, Relaxed);
+                }
             }
             if head.next.load(Relaxed, &guard).is_none() { return None }
+            if head.low.load(Relaxed) >= SEG_SIZE {
+                self.try_advance_head(head, &guard);
+            }
         }
     }
 }
