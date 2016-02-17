@@ -69,7 +69,7 @@ impl<T: Send> SpscQueue<T> {
             tail_block: AtomicPtr::new(first_block),
             cons_alive: AtomicBool::new(true),
         };
-        for _ in 0..(cache_size-1) {
+        for _ in 0..5 {
             q.release_segment(Box::into_raw(Box::new(Segment::new())), false);
         }
         let qarc = Arc::new(q);
@@ -79,14 +79,13 @@ impl<T: Send> SpscQueue<T> {
         rtuple
     }
 
-    #[inline(always)]
+    //#[inline(always)]
     fn acquire_segment(&self, alloc: bool) -> Option<*mut Segment<T>> {
-        return Some(Box::into_raw(Box::new(Segment::new())));
         let mut chead = self.cache_stack.load(Acquire);
         loop {
             if chead == ptr::null_mut() {
-                if !alloc {
-
+                if alloc {
+                    return Some(Box::into_raw(Box::new(Segment::new())));
                 }
                 else {
                     return None
@@ -98,21 +97,20 @@ impl<T: Send> SpscQueue<T> {
                 if alloc {
                     self.cache_size.fetch_sub(1, Relaxed);
                 }
+                unsafe { (*chead).next.store(ptr::null_mut(), Relaxed); }
                 return Some(chead)
             }
             chead = cas;
         }
     }
 
-    #[inline(always)]
+    //#[inline(always)]
     fn release_segment(&self, seg: *mut Segment<T>, alloc: bool) {
         // Does this need to be acquire? Consume is definitely safe here...
-        unsafe { Box::from_raw(seg); }
-        return;
         let mut chead = self.cache_stack.load(Relaxed);
         loop {
             if alloc && self.cache_size.load(Relaxed) > 3 {
-                //
+                unsafe { Box::from_raw(seg); }
                 return
             }
             unsafe { (*seg).next.store(chead, Relaxed); }
@@ -134,7 +132,7 @@ impl<T: Send> SpscQueue<T> {
     /// Tries constructing the element and inserts into the queue
     ///
     /// Returns the closure if there isn't space
-    #[inline(always)]
+    //#[inline(always)]
     pub fn try_construct<F>(&self, ctor: F, alloc: bool)
                             -> Result<(), F> where F: FnOnce() -> T {
         let ctail = self.tail.load(Relaxed);
@@ -145,7 +143,7 @@ impl<T: Send> SpscQueue<T> {
         if write_ind == 0 {
             // try to get another segment
             let next_seg_o = self.acquire_segment(alloc);
-            if alloc && next_seg_o.is_none() {
+            if !alloc && next_seg_o.is_none() {
                 return Err(ctor);
             }
             let next = next_seg_o.unwrap();
@@ -247,18 +245,18 @@ impl<T: Send> BoundedConsumer<T> {
     }
 
     /// Queries whether the producer is currently alive
-    #[inline(always)]
+    //#[inline(always)]
     pub fn is_producer_alive(&self) -> bool {
         self.spsc.prod_alive.load(Relaxed)
     }
 
     /// Attempts to pop an element from the queue
-    #[inline(always)]
+    //#[inline(always)]
     pub fn try_pop(&self) -> Option<T> {
         self.spsc.try_pop(false)
     }
 
-    #[inline(always)]
+    //#[inline(always)]
     pub fn capacity(&self) -> usize {
         self.spsc.capacity()
     }
@@ -293,7 +291,7 @@ impl<T: Send> BoundedProducer<T> {
     }
 
     /// Queries whether the consumer is currently alive
-    #[inline(always)]
+    //#[inline(always)]
     pub fn is_consumer_alive(&self) -> bool {
         self.spsc.cons_alive.load(Relaxed)
     }
@@ -302,7 +300,7 @@ impl<T: Send> BoundedProducer<T> {
     ///
     /// Returns an error with the element if the queue is full
     /// or consumer disconnected
-    #[inline(always)]
+    //#[inline(always)]
     pub fn try_push(&self, val: T) -> Result<(), T> {
         if !self.is_consumer_alive() {
             return Err(val);
@@ -314,7 +312,7 @@ impl<T: Send> BoundedProducer<T> {
     ///
     /// Returns an error with the constructor if the queue is full
     /// or consumer disconnected
-    #[inline(always)]
+    //#[inline(always)]
     pub fn try_construct<F>(&self, ctor: F) -> Result<(), F>
         where F: FnOnce() -> T {
         if !self.is_consumer_alive() {
@@ -323,7 +321,7 @@ impl<T: Send> BoundedProducer<T> {
         self.spsc.try_construct(ctor, false)
     }
 
-    #[inline(always)]
+    //#[inline(always)]
     pub fn capacity(&self) -> usize {
         self.spsc.capacity()
     }
@@ -402,7 +400,7 @@ mod test {
         let msize = 100;
         let drop_count = AtomicUsize::new(0);
         {
-            let (prod, _) = SpscQueue::<Dropper>::new(msize);
+            let (prod, _) = SpscQueue::new(msize);
             for _ in 0..msize {
                 prod.try_push(Dropper{aref: &drop_count});
             };
@@ -412,8 +410,9 @@ mod test {
 
     #[test]
     fn push_pop_many_spsc() {
+        return;
         let qsize = 100;
-        let (prod, cons) = SpscQueue::<i64>::new(5);
+        let (prod, cons) = SpscQueue::<i64>::new(100);
 
         scope(|scope| {
             scope.spawn(move || {
