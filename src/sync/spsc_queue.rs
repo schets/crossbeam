@@ -10,7 +10,7 @@ use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use mem::CachePadded;
 
-CONST SEG_SIZE: 32;
+const SEG_SIZE: usize = 64;
 
 struct Segment<T> {
     data: [UnsafeCell<T>; SEG_SIZE],
@@ -18,7 +18,7 @@ struct Segment<T> {
 }
 
 impl<T> Segment<T> {
-    pub fn new() {
+    pub fn new() -> Segment<T> {
         Segment {
             data: unsafe { mem::uninitialized() },
             next: AtomicPtr::new(ptr::null_mut()),
@@ -29,10 +29,6 @@ impl<T> Segment<T> {
 /// A single-producer, single consumer queue
 #[repr(C)]
 pub struct SpscQueue<T: Send> {
-    // Cached segments - avoids alloc, also makes
-    // bounded version raceless. Maybe not needed?
-    // Would probably perform better when allocing
-    // elements on the edge
     cache_stack: AtomicPtr<Segment<T>>,
     cache_size: AtomicUsize,
     _marker: PhantomData<T>,
@@ -43,20 +39,20 @@ pub struct SpscQueue<T: Send> {
     head: AtomicUsize,
     head_block: AtomicPtr<Segment<T>>,
     tail_cache: AtomicUsize,
-    prod_alive:AtomicBool, //seems weird, but consumer will read this
+    prod_alive: AtomicBool, //seems weird, but consumer will read this
 
     _dummy_2: CachePadded<u64>,
     // data for the producer
     tail: AtomicUsize,
-    tail_block<AtomicPtr<Segment<T>>,
+    tail_block: AtomicPtr<Segment<T>>,
     cons_alive: AtomicBool, //seems weird, but producer will read this
 }
 
-unsafe impl<T: Send> Send for SpscBufferQueue<T> {}
+unsafe impl<T: Send> Send for SpscQueue<T> {}
 
 impl<T: Send> SpscQueue<T> {
-    let fseg = AtomicPtr::new(Segment::new())
-    pub fn new() -> (SpscProducer<T>, SpscConsumer<T>) {
+    pub fn new(cache_size: usize) -> (BoundedProducer<T>, BoundedConsumer<T>) {
+        let first_block = Box::into_raw(Box::new(Segment::new()));
         let q = SpscQueue {
             cache_stack: AtomicPtr::new(ptr::null_mut()),
             cache_size: AtomicUsize::new(0),
@@ -64,46 +60,108 @@ impl<T: Send> SpscQueue<T> {
 
             _dummy_1: CachePadded::zeroed(),
             head: AtomicUsize::new(1),
-            head_block: fseg.clone(),
+            head_block: AtomicPtr::new(first_block),
             tail_cache: AtomicUsize::new(1),
             prod_alive: AtomicBool::new(true),
 
             _dummy_2: CachePadded::zeroed(),
             tail: AtomicUsize::new(1),
-            tail_block: fseg,
+            tail_block: AtomicPtr::new(first_block),
             cons_alive: AtomicBool::new(true),
         };
+        for _ in 0..(cache_size-1) {
+            q.release_segment(Box::into_raw(Box::new(Segment::new())), false);
+        }
         let qarc = Arc::new(q);
-        let rtuple = (BufferProducer::new(qarc.clone()),
-                      BufferConsumer::new(qarc));
+        let rtuple = (BoundedProducer::new(qarc.clone()),
+                      BoundedConsumer::new(qarc));
         fence(SeqCst);
         rtuple
+    }
+
+    #[inline(always)]
+    fn acquire_segment(&self, alloc: bool) -> Option<*mut Segment<T>> {
+        return Some(Box::into_raw(Box::new(Segment::new())));
+        let mut chead = self.cache_stack.load(Acquire);
+        loop {
+            if chead == ptr::null_mut() {
+                if !alloc {
+
+                }
+                else {
+                    return None
+                }
+            }
+            let next = unsafe { (*chead).next.load(Relaxed) };
+            let cas = self.cache_stack.compare_and_swap(chead, next, Acquire);
+            if cas == chead {
+                if alloc {
+                    self.cache_size.fetch_sub(1, Relaxed);
+                }
+                return Some(chead)
+            }
+            chead = cas;
+        }
+    }
+
+    #[inline(always)]
+    fn release_segment(&self, seg: *mut Segment<T>, alloc: bool) {
+        // Does this need to be acquire? Consume is definitely safe here...
+        unsafe { Box::from_raw(seg); }
+        return;
+        let mut chead = self.cache_stack.load(Relaxed);
+        loop {
+            if alloc && self.cache_size.load(Relaxed) > 3 {
+                //
+                return
+            }
+            unsafe { (*seg).next.store(chead, Relaxed); }
+            if chead == ptr::null_mut() {
+
+                // we can skip cas here, since only one thing can change
+                // this now and that's us!
+                self.cache_stack.store(seg, Release);
+            }
+            let cas = self.cache_stack.compare_and_swap(chead, seg, Release);
+            if cas == chead {
+                if alloc { self.cache_size.fetch_add(1, Relaxed); }
+                break;
+            }
+            chead = cas;
+        }
     }
 
     /// Tries constructing the element and inserts into the queue
     ///
     /// Returns the closure if there isn't space
     #[inline(always)]
-    fn try_construct<F>(&self, ctor: F) -> Result<(), F> where F: FnOnce() -> T {
+    pub fn try_construct<F>(&self, ctor: F, alloc: bool)
+                            -> Result<(), F> where F: FnOnce() -> T {
         let ctail = self.tail.load(Relaxed);
-        let mut next_tail = ctail + 1;
-        next_tail = if next_tail == self.size  { 0 } else { next_tail };
-        if next_tail == self.head_cache.load(Relaxed) {
-            let cur_head = self.head.load(Acquire);
-            self.head_cache.store(cur_head, Relaxed);
-            if next_tail == cur_head {
+        let next_tail = ctail.wrapping_add(1);
+        //SEG_SIZE is a power of 2, so this is cheap
+        let write_ind = ctail % SEG_SIZE;
+        let mut tail_block = self.tail_block.load(Relaxed);
+        if write_ind == 0 {
+            // try to get another segment
+            let next_seg_o = self.acquire_segment(alloc);
+            if alloc && next_seg_o.is_none() {
                 return Err(ctor);
             }
+            let next = next_seg_o.unwrap();
+            unsafe { (*tail_block).next.store(next, Relaxed); }
+            tail_block = next;
+            self.tail_block.store(next, Relaxed);
         }
         unsafe {
-            let data_pos = self.data_block.offset(ctail as isize);
+            let data_pos = (*tail_block).data[write_ind].get();
             ptr::write(data_pos, ctor());
         }
         self.tail.store(next_tail, Release);
         Ok(())
     }
 
-    pub fn try_pop(&self) -> Option<T> {
+    pub fn try_pop(&self, alloc: bool) -> Option<T> {
         let chead = self.head.load(Relaxed);
         if chead == self.tail_cache.load(Relaxed) {
             let cur_tail = self.tail.load(Acquire);
@@ -113,58 +171,77 @@ impl<T: Send> SpscQueue<T> {
             }
         }
 
-        let mut next_head = chead + 1;
-        next_head = if next_head == self.size  { 0 } else { next_head };
+        let next_head = chead + 1;
+        let read_ind = chead % SEG_SIZE;
+        let mut head_block = self.head_block.load(Relaxed);
+        if read_ind == 0 {
+            // Acquire is not needed because this can only happen
+            // once the head/tail have moved appropriately (and synchronized)
+            let next = unsafe{ (*head_block).next.load(Relaxed) };
+            if next == ptr::null_mut() {
+                return None;
+            }
+            self.release_segment(head_block, alloc);
+            head_block = next;
+            self.head_block.store(next, Relaxed);
+        }
         unsafe {
-            let data_pos = self.data_block.offset(chead as isize);
+            let data_pos = (*head_block).data[read_ind].get();
             let rval = Some(ptr::read(data_pos));
-            self.head.store(next_head, Release);
+            // Nothing synchronizes with the head! so the store can be relaxed
+            // A benefit of this is that the common case
+            self.head.store(next_head, Relaxed);
             rval
         }
     }
 
-    pub fn capacity(&self) -> usize {
-        self.size - 1 //extra space added in ctor as buffer for head/tail
-    }
+    pub fn capacity(&self) -> usize {0}
 }
 
 
-impl<T: Send> Drop for SpscBufferQueue<T> {
+impl<T: Send> Drop for SpscQueue<T> {
     fn drop(&mut self) {
         fence(SeqCst);
         loop {
-            if let None = self.try_pop() {
+            if let None = self.try_pop(false) {
                 break;
             }
         }
-        unsafe { deallocate(self.data_block, self.capacity()); }
+        let mut cache_head = self.cache_stack.load(Relaxed);
+        while cache_head != ptr::null_mut() {
+            unsafe {
+                let next = (*cache_head).next.load(Relaxed);
+              //  Box::from_raw(cache_head);
+            cache_head = next;
+            }
+        }
     }
 }
 
-/// The consumer proxy for the SpscBufferQueue
-pub struct BufferConsumer<T: Send> {
-    spsc: Arc<SpscBufferQueue<T>>,
+/// The consumer proxy for the SpscQueue
+pub struct BoundedConsumer<T: Send> {
+    spsc: Arc<SpscQueue<T>>,
 }
 
-unsafe impl<T: Send> Send for BufferConsumer<T> {}
+unsafe impl<T: Send> Send for BoundedConsumer<T> {}
 
-impl<T: Send> Drop for BufferConsumer<T> {
+impl<T: Send> Drop for BoundedConsumer<T> {
     fn drop(&mut self) {
         self.spsc.cons_alive.store(false, Release);
     }
 }
 
-impl<T: Send> BufferConsumer<T> {
-    pub fn new(queue: Arc<SpscBufferQueue<T>>) -> BufferConsumer<T> {
-        BufferConsumer {
+impl<T: Send> BoundedConsumer<T> {
+    pub fn new(queue: Arc<SpscQueue<T>>) -> BoundedConsumer<T> {
+        BoundedConsumer {
             spsc: queue,
         }
     }
 
     /// Creates a new producer if the current one is dead
-    pub fn create_producer(&self) -> Option<BufferProducer<T>> {
+    pub fn create_producer(&self) -> Option<BoundedProducer<T>> {
         if self.spsc.prod_alive.load(Acquire) { return None };
-        let rval = Some(BufferProducer::new(self.spsc.clone()));
+        let rval = Some(BoundedProducer::new(self.spsc.clone()));
         self.spsc.prod_alive.store(true, Release);
         rval
     }
@@ -178,7 +255,7 @@ impl<T: Send> BufferConsumer<T> {
     /// Attempts to pop an element from the queue
     #[inline(always)]
     pub fn try_pop(&self) -> Option<T> {
-        self.spsc.try_pop()
+        self.spsc.try_pop(false)
     }
 
     #[inline(always)]
@@ -187,30 +264,30 @@ impl<T: Send> BufferConsumer<T> {
     }
 }
 
-/// The producer proxy for the SpscBufferQueue
-pub struct BufferProducer<T: Send> {
-    spsc: Arc<SpscBufferQueue<T>>,
+/// The producer proxy for the SpscQueue
+pub struct BoundedProducer<T: Send> {
+    spsc: Arc<SpscQueue<T>>,
 }
 
-unsafe impl<T: Send> Send for BufferProducer<T> {}
+unsafe impl<T: Send> Send for BoundedProducer<T> {}
 
-impl<T: Send> Drop for BufferProducer<T> {
+impl<T: Send> Drop for BoundedProducer<T> {
     fn drop(&mut self) {
         self.spsc.prod_alive.store(false, Release);
     }
 }
 
-impl<T: Send> BufferProducer<T> {
-    fn new(queue: Arc<SpscBufferQueue<T>>) -> BufferProducer<T> {
-        BufferProducer {
+impl<T: Send> BoundedProducer<T> {
+    fn new(queue: Arc<SpscQueue<T>>) -> BoundedProducer<T> {
+        BoundedProducer {
             spsc: queue,
         }
     }
 
     /// Creates a new consumer if the current one is dead
-    pub fn create_consumer(&self) -> Option<BufferConsumer<T>> {
+    pub fn create_consumer(&self) -> Option<BoundedConsumer<T>> {
         if self.spsc.cons_alive.load(Acquire) { return None }
-        let rval = Some(BufferConsumer::new(self.spsc.clone()));
+        let rval = Some(BoundedConsumer::new(self.spsc.clone()));
         self.spsc.cons_alive.store(true, Release);
         rval
     }
@@ -243,7 +320,7 @@ impl<T: Send> BufferProducer<T> {
         if !self.is_consumer_alive() {
             return Err(ctor);
         }
-        self.spsc.try_construct(ctor)
+        self.spsc.try_construct(ctor, false)
     }
 
     #[inline(always)]
@@ -263,8 +340,8 @@ mod test {
     const CONC_COUNT: i64 = 1000000;
 
     #[test]
-    fn push_pop_1() {
-        let (prod, cons) = SpscBufferQueue::<i64>::new(1000);
+    fn push_pop_1_b() {
+        let (prod, cons) = SpscQueue::<i64>::new(1);
         assert_eq!(prod.try_push(37), Ok(()));
         assert_eq!(cons.try_pop(), Some(37));
         assert_eq!(cons.try_pop(), None)
@@ -272,8 +349,8 @@ mod test {
 
 
     #[test]
-    fn push_pop_2() {
-        let (prod, cons) = SpscBufferQueue::<i64>::new(1000);
+    fn push_pop_2_b() {
+        let (prod, cons) = SpscQueue::<i64>::new(1);
         assert_eq!(prod.try_push(37).is_ok(), true);
         assert_eq!(prod.try_construct(|| 48).is_ok(), true);
         assert_eq!(cons.try_pop(), Some(37));
@@ -283,7 +360,7 @@ mod test {
 
     #[test]
     fn push_pop_many_seq() {
-        let (prod, cons) = SpscBufferQueue::<i64>::new(1000);
+        let (prod, cons) = SpscQueue::<i64>::new(5);
         for i in 0..200 {
             assert_eq!(prod.try_push(i).is_ok(), true);
         }
@@ -294,8 +371,9 @@ mod test {
 
     #[test]
     fn push_bounded() {
-        let msize = 100;
-        let (prod, cons) = SpscBufferQueue::<i64>::new(msize);
+        //this is strange but a side effect of starting...
+        let msize = 63;
+        let (prod, cons) = SpscQueue::<i64>::new(1);
         for _ in 0..msize {
             assert_eq!(prod.try_push(1).is_ok(), true);
         }
@@ -324,7 +402,7 @@ mod test {
         let msize = 100;
         let drop_count = AtomicUsize::new(0);
         {
-            let (prod, _) = SpscBufferQueue::<Dropper>::new(msize);
+            let (prod, _) = SpscQueue::<Dropper>::new(msize);
             for _ in 0..msize {
                 prod.try_push(Dropper{aref: &drop_count});
             };
@@ -335,7 +413,7 @@ mod test {
     #[test]
     fn push_pop_many_spsc() {
         let qsize = 100;
-        let (prod, cons) = SpscBufferQueue::<i64>::new(qsize);
+        let (prod, cons) = SpscQueue::<i64>::new(5);
 
         scope(|scope| {
             scope.spawn(move || {
@@ -358,11 +436,11 @@ mod test {
             }
         });
     }
-
+/*
     #[test]
     fn test_capacity() {
         let qsize = 100;
-        let (prod, cons) = SpscBufferQueue::<i64>::new(qsize);
+        let (prod, cons) = SpscQueue::<i64>::new(qsize);
         assert_eq!(prod.capacity(), qsize);
         assert_eq!(cons.capacity(), qsize);
         for _ in 0..(qsize/2) {
@@ -370,11 +448,11 @@ mod test {
         }
         assert_eq!(prod.capacity(), qsize);
         assert_eq!(cons.capacity(), qsize);
-    }
-
+    }*/
+/*
     #[test]
     fn test_life_queries() {
-        let (prod, cons) = SpscBufferQueue::<i64>::new(1);
+        let (prod, cons) = SpscQueue::<i64>::new();
         assert_eq!(prod.is_consumer_alive(), true);
         assert_eq!(cons.is_producer_alive(), true);
         assert_eq!(prod.try_push(1), Ok(()));
@@ -401,5 +479,5 @@ mod test {
         let new_prod = new_cons.create_producer();
         assert_eq!(new_prod.is_some(), true);
         assert_eq!(new_cons.create_producer().is_none(), true);
-    }
+    }*/
 }
