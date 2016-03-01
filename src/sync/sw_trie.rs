@@ -9,7 +9,8 @@ struct Node<K, V> {
     key: K,
     val: V,
     hash: u64,
-    Atomic<Node<K, V>> next,
+    Atomic<Node<K, V>> next_iter,
+    Atomic<Node<K, V>>
 }
 
 struct Table<K, V> {
