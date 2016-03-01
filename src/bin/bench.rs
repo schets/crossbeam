@@ -19,7 +19,7 @@ use extra_impls::mpsc_queue::Queue as MpscQueue;
 mod extra_impls;
 
 const COUNT: u64 = 10000000;
-const THREADS: u64 = 2;
+const THREADS: u64 = 3;
 
 //#[cfg(feature = "nightly")]
 fn time<F: FnOnce()>(f: F) -> Duration {
