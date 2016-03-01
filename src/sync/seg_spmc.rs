@@ -17,13 +17,10 @@ pub struct SegSpmc<T> {
     tail: Atomic<Segment<T>>,
 }
 
-// This could easily be abtracted into a central area
 //#[repr(C)]
 struct Segment<T> {
     low: AtomicUsize,
-    _dummy: [usize; 8],
     high: AtomicUsize,
-    _dummy2: [usize; 8],
     next: Atomic<Segment<T>>,
     data: [UnsafeCell<T>; SEG_SIZE],
 }
@@ -35,8 +32,6 @@ impl<T> Segment<T> {
         Segment {
             data: unsafe { mem::uninitialized() },
             low: AtomicUsize::new(0),
-            _dummy: unsafe { mem::uninitialized() },
-            _dummy2: unsafe { mem::uninitialized() },
             high: AtomicUsize::new(0),
             next: Atomic::null(),
         }
@@ -101,8 +96,6 @@ impl<T> SegSpmc<T> {
                 let curhigh = head.high.load(Relaxed);
                 let low = head.low.load(Relaxed);
                 if low >= cmp::min(curhigh, SEG_SIZE) { break; }
-                // There's a version that uses fetch_add and should be faster
-                // but I can't get it to work...
                 let attempt = head.low.fetch_add(1, Acquire);
                 if attempt < curhigh {
                     unsafe {

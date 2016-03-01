@@ -19,7 +19,7 @@ use extra_impls::mpsc_queue::Queue as MpscQueue;
 mod extra_impls;
 
 const COUNT: u64 = 10000000;
-const THREADS: u64 = 3;
+const THREADS: u64 = 2;
 
 //#[cfg(feature = "nightly")]
 fn time<F: FnOnce()>(f: F) -> Duration {
@@ -130,16 +130,10 @@ fn bench_queue_mpmc<Q: Queue<bool> + Sync>(q: Q) -> f64 {
 }
 
 fn bench_queue_spmc<Q: Queue<bool> + Sync>(q: Q) -> f64 {
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering::Relaxed;
-
-    let prod_count = AtomicUsize::new(0);
-
     let d = time(|| {
         scope(|scope| {
-            for _i in 0..THREADS {
+            for _ in 0..THREADS {
                 let qr = &q;
-                let pcr = &prod_count;
                 scope.spawn(move || {
                     loop {
                         if let Some(false) = qr.try_pop() {
@@ -148,10 +142,10 @@ fn bench_queue_spmc<Q: Queue<bool> + Sync>(q: Q) -> f64 {
                     }
                 });
             }
-            for i in 0..(COUNT*THREADS) {
+            for _ in 0..(COUNT*THREADS) {
                 q.push(true);
             }
-            for i in 0..THREADS {
+            for _ in 0..THREADS {
                 q.push(false);
             }
         });
