@@ -5,6 +5,7 @@ pub use self::atomic_option::AtomicOption;
 pub use self::treiber_stack::TreiberStack;
 pub use self::seg_queue::SegQueue;
 
+mod sw_trie;
 mod atomic_option;
 mod ms_queue;
 mod treiber_stack;
