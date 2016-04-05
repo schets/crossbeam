@@ -2,12 +2,13 @@
 // of the actual epoch management logic happens!
 
 use std::mem;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{self, AtomicUsize, AtomicBool};
 use std::sync::atomic::Ordering::{Relaxed, Acquire, Release, SeqCst};
 
 use mem::epoch::{Atomic, Guard, garbage, global};
 use mem::epoch::participants::ParticipantNode;
+use mem::epoch::options::Options;
 
 /// Thread-local data for epoch participation.
 pub struct Participant {
@@ -20,6 +21,9 @@ pub struct Participant {
 
     /// Thread-local garbage tracking
     garbage: UnsafeCell<garbage::Local>,
+
+    /// Thread-local GC options
+    options: Options,
 
     /// Is the thread still active? Becomes `false` when the thread exits. This
     /// is ultimately used to free `Participant` records.
@@ -38,9 +42,16 @@ impl Participant {
         Participant {
             epoch: AtomicUsize::new(0),
             in_critical: AtomicUsize::new(0),
+            options: Options::new(),
             active: AtomicBool::new(true),
             garbage: UnsafeCell::new(garbage::Local::new()),
             next: Atomic::null(),
+        }
+    }
+
+    fn collect_local(&self) {
+        if self.options.will_run_local_gc() {
+            unsafe { (*self.garbage.get()).collect(); }
         }
     }
 
@@ -60,9 +71,8 @@ impl Participant {
         let global_epoch = global::get().epoch.load(Relaxed);
         if global_epoch != self.epoch.load(Relaxed) {
             self.epoch.store(global_epoch, Relaxed);
-            unsafe { (*self.garbage.get()).collect(); }
+            self.collect_local();
         }
-
         true
     }
 
@@ -98,8 +108,10 @@ impl Participant {
         }
 
         unsafe {
-            (*self.garbage.get()).collect();
-            global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
+            self.collect_local();
+            if self.options.will_run_global_gc() {
+                global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
+            }
         }
         self.epoch.store(new_epoch, Release);
 
