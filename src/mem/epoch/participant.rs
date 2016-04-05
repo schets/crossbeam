@@ -90,6 +90,11 @@ impl Participant {
     ///
     /// Returns `true` on success.
     pub fn try_collect(&self, guard: &Guard) -> bool {
+        if global::get().updating_epoch.load(Relaxed) {
+            return false;
+        }
+
+        global::get().updating_epoch.store(true, Relaxed);
         let cur_epoch = global::get().epoch.load(SeqCst);
 
         for p in global::get().participants.iter(guard) {
@@ -103,13 +108,15 @@ impl Participant {
         if global::get().epoch.compare_and_swap(cur_epoch, new_epoch, SeqCst) != cur_epoch {
             return false
         }
+        // A compiler barrier here would be useful to ensure
+        // no reordering around the GC, but it's valid either way
+        global::get().updating_epoch.store(false, Relaxed);
 
         unsafe {
             (*self.garbage.get()).collect();
             global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
         }
         self.epoch.store(new_epoch, Release);
-
         true
     }
 

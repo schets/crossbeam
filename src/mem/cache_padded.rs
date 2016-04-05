@@ -56,6 +56,7 @@ zeros_valid!(u8 u16 u32 u64 usize);
 zeros_valid!(i8 i16 i32 i64 isize);
 
 unsafe impl ZerosValid for ::std::sync::atomic::AtomicUsize {}
+unsafe impl ZerosValid for ::std::sync::atomic::AtomicBool {}
 unsafe impl<T> ZerosValid for ::std::sync::atomic::AtomicPtr<T> {}
 
 impl<T: ZerosValid> CachePadded<T> {

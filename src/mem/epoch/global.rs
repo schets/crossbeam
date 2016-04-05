@@ -1,7 +1,7 @@
 // Definition of global epoch state. The `get` function is the way to
 // access this data externally (until const fn is stabilized...).
 
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, AtomicBool};
 
 use mem::CachePadded;
 use mem::epoch::garbage;
@@ -12,6 +12,9 @@ use mem::epoch::participants::Participants;
 pub struct EpochState {
     /// Current global epoch
     pub epoch: CachePadded<AtomicUsize>,
+
+    /// Approximate flag for signalling that epoch is already advancing
+    pub updating_epoch: CachePadded<AtomicBool>,
 
     // FIXME: move this into the `garbage` module, rationalize API
     /// Global garbage bags
@@ -40,6 +43,7 @@ mod imp {
         fn new() -> EpochState {
             EpochState {
                 epoch: CachePadded::zeroed(),
+                updating_epoch: CachePadded::zeroed(),
                 garbage: [CachePadded::zeroed(),
                           CachePadded::zeroed(),
                           CachePadded::zeroed()],
