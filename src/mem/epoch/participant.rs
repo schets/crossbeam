@@ -83,11 +83,12 @@ impl Participant {
     ///
     /// Returns `true` on success.
     pub fn try_collect(&self, guard: &Guard) -> bool {
-        if global::get().updating_epoch.load(Relaxed) == 0 {
+        if global::get().updating_epoch.load(Relaxed) != 0 {
             return false;
         }
-        global::get().updating_epoch.store(1, Relaxed);
+
         let cur_epoch = global::get().epoch.load(SeqCst);
+        global::get().updating_epoch.store(1, Relaxed);
 
         for p in global::get().participants.iter(guard) {
             if p.in_critical.load(Relaxed) > 0 && p.epoch.load(Relaxed) != cur_epoch {
@@ -100,12 +101,12 @@ impl Participant {
         if global::get().epoch.compare_and_swap(cur_epoch, new_epoch, SeqCst) != cur_epoch {
             return false
         }
+        global::get().updating_epoch.store(0, Relaxed);
 
         unsafe {
             (*self.garbage.get()).collect();
             global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
         }
-        global::get().updating_epoch.store(0, Relaxed);
         self.epoch.store(new_epoch, Release);
         true
     }
