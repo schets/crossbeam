@@ -79,36 +79,52 @@ impl Participant {
         (*self.garbage.get()).insert(data);
     }
 
-    /// Attempt to collect garbage by moving the global epoch forward.
-    ///
-    /// Returns `true` on success.
-    pub fn try_collect(&self, guard: &Guard) -> bool {
-        if global::get().updating_epoch.load(Relaxed) != 0 {
-            return false;
-        }
-
+    fn advance_epoch(&self, guard: &Guard) -> Option<usize> {
         let cur_epoch = global::get().epoch.load(SeqCst);
-        global::get().updating_epoch.store(1, Relaxed);
 
         for p in global::get().participants.iter(guard) {
             if p.in_critical.load(Relaxed) > 0 && p.epoch.load(Relaxed) != cur_epoch {
-                return false
+                return None
             }
         }
 
         let new_epoch = cur_epoch.wrapping_add(1);
         atomic::fence(Acquire);
         if global::get().epoch.compare_and_swap(cur_epoch, new_epoch, SeqCst) != cur_epoch {
-            return false
+            return None
         }
-        global::get().updating_epoch.store(0, Relaxed);
+        Some(new_epoch)
+    }
 
-        unsafe {
-            (*self.garbage.get()).collect();
-            global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
+    /// Attempt to collect garbage by moving the global epoch forward.
+    /// Doesn't respect the flag for an active update and resets it
+    ///
+    /// Returns `true` on success.
+    pub fn force_try_collect(&self, guard: &Guard) -> bool {
+
+        let advanced = self.advance_epoch(guard);
+        global::get().updating_epoch.store(0, Relaxed);
+        if let Some(new_epoch) = advanced {
+            unsafe {
+                (*self.garbage.get()).collect();
+                global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
+            }
+            self.epoch.store(new_epoch, Release);
+            true
         }
-        self.epoch.store(new_epoch, Release);
-        true
+        else { false }
+    }
+
+    /// Attempt to collect garbage by moving the global epoch forward.
+    /// Fails if anther thread is already advancing
+    ///
+    /// Returns
+    pub fn try_collect(&self, guard: &Guard) -> bool {
+        if global::get().updating_epoch.load(Relaxed) != 0 {
+            return false;
+        }
+        global::get().updating_epoch.store(1, Relaxed);
+        self.force_try_collect(guard)
     }
 
     /// Move the current thread-local garbage into the global garbage bags.
@@ -124,8 +140,14 @@ impl Participant {
     pub fn garbage_size(&self) -> usize {
         unsafe { (*self.garbage.get()).size() }
     }
+
     /// Is this participant past its local GC threshhold?
     pub fn should_gc(&self) -> bool {
         self.garbage_size() >= GC_THRESH
+    }
+
+    /// Is this participant way past its local GC threshhold? Epoch likely stuck
+    pub fn really_should_gc(&self) -> bool {
+        self.garbage_size() >= 2 * GC_THRESH
     }
 }

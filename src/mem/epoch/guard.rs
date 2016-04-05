@@ -28,7 +28,8 @@ pub fn pin() -> Guard {
         };
 
         if p.should_gc() {
-            p.try_collect(&g);
+            if p.really_should_gc() { p.force_try_collect(&g); }
+            else { p.try_collect(&g); }
         }
 
         g
