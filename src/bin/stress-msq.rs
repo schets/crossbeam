@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 const DUP: usize = 4;
 const THREADS: u32 = 2;
-const COUNT: u64 = 100000;
+const COUNT: u64 = 1024;
+const TIMERUN: u64 = 10000000;
 
-fn main() {
+fn _main() {
     scope(|s| {
         for _i in 0..DUP {
             let q = Arc::new(MsQueue::new());
@@ -33,4 +34,10 @@ fn main() {
             }
         }
     });
+}
+
+fn main() {
+    for _ in 0..TIMERUN {
+        _main();
+    }
 }

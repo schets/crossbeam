@@ -119,9 +119,10 @@ impl<'a> Iterator for Iter<'a> {
 
                 if !on_head
                    && self.free_lock.load(Relaxed) == 0
-                   && self.free_lock.swap(1, Acquire) == 0 {
-                    self.next.store_shared(cur, Relaxed);
+                   && self.free_lock.swap(1, Acquire) == 0
+                   && self.next.cas_shared(Some(n), cur, Relaxed) {
                     unsafe { self.guard.unlinked(n); }
+                    self.free_lock.store(0, Release);
                 }
 
             } else {
@@ -137,7 +138,6 @@ impl<'a> Iterator for Iter<'a> {
 impl<'a> Drop for Iter<'a> {
     fn drop(&mut self) {
         if self.free_lock.load(Relaxed) != 0 {
-            self.free_lock.store(0, Release);
         }
     }
 }
