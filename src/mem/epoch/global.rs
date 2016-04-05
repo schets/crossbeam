@@ -12,6 +12,9 @@ pub struct EpochState {
     /// Current global epoch
     pub epoch: CachePadded<AtomicUsize>,
 
+    /// Approximate flag for signalling that epoch is already advancing
+    pub updating_epoch: CachePadded<AtomicUsize>,
+
     // FIXME: move this into the `garbage` module, rationalize API
     /// Global garbage bags
     pub garbage: [CachePadded<garbage::ConcBag>; 3],
@@ -39,6 +42,7 @@ mod imp {
         fn new() -> EpochState {
             EpochState {
                 epoch: CachePadded::zeroed(),
+                updating_epoch: CachePadded::zeroed(),
                 garbage: [CachePadded::zeroed(),
                           CachePadded::zeroed(),
                           CachePadded::zeroed()],

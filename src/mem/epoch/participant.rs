@@ -83,6 +83,10 @@ impl Participant {
     ///
     /// Returns `true` on success.
     pub fn try_collect(&self, guard: &Guard) -> bool {
+        if global::get().updating_epoch.load(Relaxed) == 0 {
+            return false;
+        }
+        global::get().updating_epoch.store(1, Relaxed);
         let cur_epoch = global::get().epoch.load(SeqCst);
 
         for p in global::get().participants.iter(guard) {
@@ -101,8 +105,8 @@ impl Participant {
             (*self.garbage.get()).collect();
             global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
         }
+        global::get().updating_epoch.store(0, Relaxed);
         self.epoch.store(new_epoch, Release);
-
         true
     }
 
