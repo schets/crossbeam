@@ -10,7 +10,7 @@ pub struct Options {
     /// Will the thread run the global GC, default true
     pub global_gc: bool,
 
-    /// Migrates local garbage instead of collecting it, default true
+    /// Migrates local garbage when collecting is disabled, default true
     pub migrate_local: bool,
 
     /// Allows one to forcibly disable GC
@@ -88,8 +88,6 @@ impl Options {
     pub fn will_run_global_gc(&self) -> bool {
         !self.force_no_gc & self.global_gc
     }
-
-
 
     pub fn with_gc_num<'a>(&'a mut self, val: usize) -> &'a mut Options {
         self.gc_num = val;

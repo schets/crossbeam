@@ -137,6 +137,7 @@ mod options;
 
 pub use self::atomic::Atomic;
 pub use self::guard::{pin, Guard};
+pub use self::options::Options;
 
 use std::ops::{Deref, DerefMut};
 use std::ptr;

@@ -84,11 +84,22 @@ impl Local {
         self.new.insert(elem)
     }
 
+    fn rotate_bags(&mut self) {
+        mem::swap(&mut self.old, &mut self.cur);
+        mem::swap(&mut self.cur, &mut self.new);
+    }
+
     /// Collect one epoch of garbage, rotating the local garbage bags.
     pub unsafe fn collect(&mut self) {
         let ret = self.old.collect();
-        mem::swap(&mut self.old, &mut self.cur);
-        mem::swap(&mut self.cur, &mut self.new);
+        self.rotate_bags();
+        ret
+    }
+
+    pub unsafe fn reset_old(&mut self) -> Bag {
+        let mut ret = Bag::new();
+        mem::swap(&mut ret, &mut self.old);
+        self.rotate_bags();
         ret
     }
 

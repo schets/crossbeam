@@ -23,7 +23,7 @@ pub struct Participant {
     garbage: UnsafeCell<garbage::Local>,
 
     /// Thread-local GC options
-    options: Options,
+    options: Cell<Options>,
 
     /// Is the thread still active? Becomes `false` when the thread exits. This
     /// is ultimately used to free `Participant` records.
@@ -42,16 +42,20 @@ impl Participant {
         Participant {
             epoch: AtomicUsize::new(0),
             in_critical: AtomicUsize::new(0),
-            options: Options::new(),
+            options: Cell::new(Options::new()),
             active: AtomicBool::new(true),
             garbage: UnsafeCell::new(garbage::Local::new()),
             next: Atomic::null(),
         }
     }
 
-    fn collect_local(&self) {
-        if self.options.will_run_local_gc() {
-            unsafe { (*self.garbage.get()).collect(); }
+    unsafe fn collect_local(&self, epoch: usize) {
+        if self.options.get().will_run_local_gc() {
+           (*self.garbage.get()).collect();
+        }
+        else if self.options.get().migrate_local {
+            let old_bag = (*self.garbage.get()).reset_old();
+            global::get().garbage[epoch.wrapping_sub(1) % 3].insert(old_bag);
         }
     }
 
@@ -71,7 +75,7 @@ impl Participant {
         let global_epoch = global::get().epoch.load(Relaxed);
         if global_epoch != self.epoch.load(Relaxed) {
             self.epoch.store(global_epoch, Relaxed);
-            self.collect_local();
+            unsafe { self.collect_local(global_epoch); }
         }
         true
     }
@@ -108,9 +112,12 @@ impl Participant {
         }
 
         unsafe {
-            self.collect_local();
-            if self.options.will_run_global_gc() {
+            if self.options.get().will_run_global_gc() {
                 global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
+                (*self.garbage.get()).collect();
+            }
+            else {
+                self.collect_local(new_epoch);
             }
         }
         self.epoch.store(new_epoch, Release);
