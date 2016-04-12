@@ -9,6 +9,7 @@ pub use self::arc_cell::ArcCell;
 mod atomic_option;
 mod ms_queue;
 mod treiber_stack;
+mod elimination_stack;
 mod seg_queue;
 pub mod chase_lev;
 mod arc_cell;
