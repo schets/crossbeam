@@ -1,0 +1,124 @@
+use std::sync::atomic::{AtomicPtr, AtomicBool, AtomicUsize, fence};
+use std::sync::atomic::Ordering::{Relaxed, Acquire, Release};
+use std::cell::UnsafeCell;
+use std::thread;
+use std::mem;
+use std::ptr;
+
+const WAITING: usize = 0;
+const IN_PROGRESS: usize = 1;
+const COMPLETED: usize = 2;
+const POISONED: usize = 3;
+
+struct Message {
+    op: *const FnOnce(),
+    next: AtomicPtr<Message>,
+    status: AtomicUsize,
+}
+
+impl Message {
+    pub fn new(op: *const FnOnce()) -> Message {
+        Message {
+            op: op,
+            next: AtomicPtr::new(ptr::null_mut()),
+            status: AtomicUsize::new(WAITING),
+        }
+    }
+
+    pub fn process(&self) {
+        self.status.store(IN_PROGRESS, Relaxed);
+        unsafe { (*self.op)(); }
+        self.status.store(COMPLETED, Release);
+        self.awaken();
+    }
+
+    fn awaken(&self) {}
+
+    pub fn propagate_panic(&self) {}
+}
+
+unsafe impl Send for Message {}
+
+pub struct FlatCombiner {
+    /// An atomic stackish structure
+    message_stack_head: AtomicPtr<Message>,
+
+    /// A queue of messages local to the datastructure
+    local_messages: AtomicPtr<Message>,
+
+    used: AtomicBool,
+
+    poisoned: AtomicBool,
+}
+
+impl FlatCombiner {
+    pub fn new() -> FlatCombiner {
+        FlatCombiner {
+            message_stack_head: AtomicPtr::new(ptr::null_mut()),
+            local_messages: AtomicPtr::new(ptr::null_mut()),
+            used: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
+        }
+    }
+
+    fn get_and_process(&self, cur_message: &AtomicPtr<Message>) -> bool {
+        false
+    }
+
+    // This is references because there's no sane panic-handling api yet
+    // and I need to also do funky things
+    fn unsafe_read_messages(s: &AtomicPtr<FlatCombiner>, n_max: usize, cur_message: &AtomicPtr<Message>) {
+        let sptr = &(unsafe { *s.load(Relaxed) });
+        for i in 0..n_max {
+            if !sptr.get_and_process(cur_message) { break; }
+        }
+    }
+
+    fn read_messages(&self, n_max: usize) {
+        let m: AtomicPtr<Message> = AtomicPtr::new(ptr::null_mut());
+        let s: AtomicPtr<FlatCombiner> = AtomicPtr::new(unsafe { mem::transmute(self) });
+        // Panic handling is expensive, so it's done out here...
+        if let Err(cause) = thread::catch_panic(|| FlatCombiner::unsafe_read_messages(&s, n_max, &m)) {
+            let cur_msg = m.load(Relaxed);
+            if cur_msg != ptr::null_mut() {
+                unsafe { (*cur_msg).propagate_panic(); }
+            }
+            self.poison_self();
+        }
+    }
+
+    fn alert_next(&self) {
+    }
+
+    fn poison_self(&self) {}
+
+    fn try_operation<F: Send + FnOnce()>(&self, op: *const F) -> bool {
+        let lock_val = self.used.load(Relaxed);
+        if lock_val || !self.used.compare_and_swap(false, true, Acquire) {
+            false
+        }
+        else {
+            self.read_messages(50);
+            true
+        }
+    }
+
+    // Holy shitbags rustc I can ensure this will live long enough
+    pub fn submit<F: Send + FnOnce()>(&self, op: F) {
+        if !self.try_operation(&op) {
+            let mut message = Message::new(unsafe { mem::transmute(&op) });
+            loop {
+                let cur_head = self.message_stack_head.load(Relaxed);
+                message.next.store(cur_head, Relaxed);
+                let old_head = self.message_stack_head.compare_and_swap(cur_head,
+                                                                        &mut message,
+                                                                        Release);
+                if old_head == cur_head {
+                    break;
+                }
+            }
+            while message.status.load(Relaxed) != COMPLETED { thread::yield_now(); }
+            fence(Acquire)
+        }
+    }
+}
