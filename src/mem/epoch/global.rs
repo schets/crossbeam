@@ -13,7 +13,7 @@ pub struct EpochState {
     /// Current global epoch
     pub epoch: CachePadded<AtomicUsize>,
 
-    /// Approximate flag for signalling that epoch is already advancing
+    /// Flag for signalling that epoch is already advancing
     pub updating_epoch: CachePadded<AtomicBool>,
 
     // FIXME: move this into the `garbage` module, rationalize API

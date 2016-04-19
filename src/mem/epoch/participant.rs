@@ -86,38 +86,43 @@ impl Participant {
         (*self.garbage.get()).insert(data);
     }
 
-    /// Attempt to collect garbage by moving the global epoch forward.
-    ///
-    /// Returns `true` on success.
-    pub fn try_collect(&self, guard: &Guard) -> bool {
-        if global::get().updating_epoch.load(Relaxed) {
-            return false;
-        }
-
-        global::get().updating_epoch.store(true, Relaxed);
-        let cur_epoch = global::get().epoch.load(SeqCst);
+    fn move_epoch(guard: &Guard) -> Option<usize> {
+        let cur_epoch = global::get().epoch.load(Relaxed);
 
         for p in global::get().participants.iter(guard) {
             if p.in_critical.load(Relaxed) > 0 && p.epoch.load(Relaxed) != cur_epoch {
-                return false
+                return None
             }
         }
 
         let new_epoch = cur_epoch.wrapping_add(1);
-        atomic::fence(Acquire);
-        if global::get().epoch.compare_and_swap(cur_epoch, new_epoch, SeqCst) != cur_epoch {
-            return false
-        }
-        // A compiler barrier here would be useful to ensure
-        // no reordering around the GC, but it's valid either way
-        global::get().updating_epoch.store(false, Relaxed);
+        global::get().epoch.store(new_epoch, Relaxed);
+        Some(new_epoch)
+    }
 
-        unsafe {
-            (*self.garbage.get()).collect();
-            global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
+    /// Attempt to collect garbage by moving the global epoch forward.
+    ///
+    /// Returns `true` on success.
+    pub fn try_collect(&self, guard: &Guard) -> bool {
+        if global::get().updating_epoch.load(Relaxed) ||
+           global::get().updating_epoch.compare_and_swap(false, true, Acquire) {
+            return false;
         }
-        self.epoch.store(new_epoch, Release);
-        true
+
+        let moved = Participant::move_epoch(guard);
+
+        global::get().updating_epoch.store(false, Release);
+
+        match moved {
+            None => false,
+
+            Some(new_epoch) => unsafe {
+                (*self.garbage.get()).collect();
+                global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
+                self.epoch.store(new_epoch, Release);
+                true
+            }
+        }
     }
 
     /// Move the current thread-local garbage into the global garbage bags.
