@@ -28,12 +28,6 @@ impl Message {
     pub fn process(&self) {
         self.status.store(IN_PROGRESS, Relaxed);
 
-        // Rust shouldn't reorder around function calls,
-        // but a formal compiler barrier would be nice. This doesn't need
-        // a fence since the IN_PROGRESS status is just for info and can
-        // be approximate
-
-        //ALSO NOT PANIC SAFE YET
         unsafe { (self.op)() };
         self.status.store(COMPLETED, Release);
         self.awaken();
@@ -51,7 +45,7 @@ pub struct FlatCombiner {
     message_stack_head: AtomicPtr<Message>,
 
     /// A queue of messages local to the datastructure
-    local_messages: AtomicPtr<Message>,
+    local_messages: Cell<*mut Message>,
 
     used: AtomicBool,
 
@@ -62,14 +56,25 @@ impl FlatCombiner {
     pub fn new() -> FlatCombiner {
         FlatCombiner {
             message_stack_head: AtomicPtr::new(ptr::null_mut()),
-            local_messages: AtomicPtr::new(ptr::null_mut()),
+            local_messages: Cell::new(ptr::null_mut()),
             used: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
         }
     }
 
-    fn get_and_process(&self) -> bool {
-        false
+    fn load_messages(&self) -> bool {
+        // Make the local_messages check an invariant?
+        if self.local_messages.get() == ptr::null_mut() &&
+           self.message_stack_head.load(Relaxed) != ptr::null_mut() {
+            let head = self.message_stack_head.swap(ptr::null_mut(), Acquire);
+            self.local_messages.set(head);
+            true
+        }
+        else { false }
+    }
+
+    fn get_and_process(&self) -> usize {
+        0
     }
 
     // No panic handling yet...
