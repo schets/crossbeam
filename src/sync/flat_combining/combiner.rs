@@ -11,13 +11,13 @@ const COMPLETED: usize = 2;
 const POISONED: usize = 3;
 
 struct Message {
-    op: *const FnOnce(),
+    op: unsafe fn(),
     next: AtomicPtr<Message>,
     status: AtomicUsize,
 }
 
 impl Message {
-    pub fn new(op: *const FnOnce()) -> Message {
+    pub fn new(op: fn()) -> Message {
         Message {
             op: op,
             next: AtomicPtr::new(ptr::null_mut()),
@@ -27,7 +27,14 @@ impl Message {
 
     pub fn process(&self) {
         self.status.store(IN_PROGRESS, Relaxed);
-        unsafe { (*self.op)(); }
+
+        // Rust shouldn't reorder around function calls,
+        // but a formal compiler barrier would be nice. This doesn't need
+        // a fence since the IN_PROGRESS status is just for info and can
+        // be approximate
+
+        //ALSO NOT PANIC SAFE YET
+        unsafe { (self.op)() };
         self.status.store(COMPLETED, Release);
         self.awaken();
     }
@@ -83,12 +90,11 @@ impl FlatCombiner {
             false
         }
         else {
-            self.read_messages(50);
+            self.read_messages(20);
             true
         }
     }
 
-    // Holy shitbags rustc I can ensure this will live long enough
     pub fn submit<F: Send + FnOnce()>(&self, op: F) {
         if !self.try_operation(&op) {
             let mut message = Message::new(unsafe { mem::transmute(&op) });
