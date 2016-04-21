@@ -8,9 +8,10 @@ use std::ptr;
 
 const WAITING: usize = 0;
 const IN_PROGRESS: usize = 1;
-const TAKE_OVER = 2;
-const COMPLETED: usize = 3;
-const POISONED: usize = 4;
+const TAKE_OVER: usize = 2;
+const RETRY: usize = 3;
+const COMPLETED: usize = 4;
+const POISONED: usize = 5;
 
 struct Message {
     op: unsafe fn(),
