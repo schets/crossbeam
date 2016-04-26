@@ -14,13 +14,13 @@ const COMPLETED: usize = 4;
 const POISONED: usize = 5;
 
 struct Message {
-    op: unsafe fn(),
+    op: *const FnMut(),
     next: AtomicPtr<Message>,
     status: AtomicUsize,
 }
 
 impl Message {
-    pub fn new(op: fn()) -> Message {
+    pub fn new(op: *const FnMut()) -> Message {
         Message {
             op: op,
             next: AtomicPtr::new(ptr::null_mut()),
@@ -30,8 +30,7 @@ impl Message {
 
     pub fn process(&self) {
         self.status.store(IN_PROGRESS, Relaxed);
-
-        unsafe { (self.op)() };
+        unsafe { (&*self.op)() };
         self.status.store(COMPLETED, Release);
 
         // Prevent reordering of on_completed after completion?
@@ -99,6 +98,8 @@ impl FlatCombiner {
                 Some(head) => mhead = head,
             };
         }
+        let mnext = unsafe { (*mhead).next.load(Relaxed) };
+        self.local_messages.set(mnext);
         Some(mhead)
     }
 
@@ -118,68 +119,88 @@ impl FlatCombiner {
     }
 
     fn alert_next(&self) {
+        let mut mhead = self.local_messages.get();
+        if mhead == ptr::null_mut() {
+            match self.load_messages() {
+                Some(head) => mhead = head,
+                None => return,
+            }
+        }
+        unsafe { (*mhead).status.store(TAKE_OVER, Release) };
         self.wakeup.notify_all();
     }
 
-    fn poison_self(&self) {}
+    fn run_operation<F: Send + FnOnce()>(&self, op: F) {
+        op();
+        self.read_messages(20);
+        self.alert_next();
+    }
 
-    #[inline(always)]
     fn try_operation<F: Send + FnOnce()>(&self, op: F) -> Option<F> {
         let lock_val = self.used.load(Relaxed);
         if lock_val || self.used.compare_and_swap(false, true, Acquire) {
             Some(op)
         }
         else {
-            op();
-            self.read_messages(20);
-            self.alert_next();
+            self.run_operation(op);
             None
         }
     }
 
-    pub fn submit<F: Send + FnOnce() -> R, R: Send>(&self, _op: F) -> R {
+    fn wait_on(&self, status: &AtomicUsize) -> usize {
+        for _ in 0..200 {
+            let stat = status.load(Relaxed);
+            if stat > IN_PROGRESS {
+                return stat;
+            }
+        }
+
+        loop {
+            let stat = status.load(Relaxed);
+            if stat > IN_PROGRESS {
+                return stat;
+            }
+            thread::yield_now();
+        }
+
+        // fat, heavy waiting loop. Hopefully this is never reached
+        // Also, future schemes will let users specify the impl...
+        let mut waiting = self.wakeup_mut.lock().unwrap();
+        while status.load(Relaxed) <= IN_PROGRESS {
+            waiting = self.wakeup.wait(waiting).unwrap();
+        }
+
+        return status.load(Relaxed);
+    }
+
+    pub fn submit<F: Send + FnMut() -> R, R: Send>(&self, _op: F) -> R {
         let mut rval: R = unsafe { mem::uninitialized() };
         {
             let rval_ref = &mut rval;
             let op = || *rval_ref = _op();
             if let Some(op) = self.try_operation(op) {
-                let mut message = Message::new(unsafe { mem::transmute(&op) });
                 loop {
-                    let cur_head = self.message_stack_head.load(Relaxed);
-                    message.next.store(cur_head, Relaxed);
-                    let old_head = self.message_stack_head.compare_and_swap(cur_head,
-                        &mut message,
-                        Release);
-                    if old_head == cur_head {
-                        break;
-                    }
-                }
-
-                // ewwwwwwwww
-                // Move into dedicated function,  will satisfy owner shenanigans
-                'goto: loop {
-                    for _ in 0..50 {
-                        if message.status.load(Relaxed) == COMPLETED {
-                            break 'goto;
-                        }
-                    }
-
+                    let mut message = Message::new(&op);
                     loop {
-                        if message.status.load(Relaxed) == COMPLETED {
-                            break 'goto;
+                        let cur_head = self.message_stack_head.load(Relaxed);
+                        message.next.store(cur_head, Relaxed);
+                        let old_head = self.message_stack_head.compare_and_swap(cur_head,
+                                                                                &mut message,
+                                                                                Release);
+                        if old_head == cur_head {
+                            break;
                         }
-                        thread::yield_now();
                     }
 
-                    // fat, heavy waiting loop. Hopefully this is never reached
-                    // Also, future schemes will let users specify the impl...
-                    let mut waiting = self.wakeup_mut.lock().unwrap();
-                    while message.status.load(Relaxed) != COMPLETED {
-                        waiting = self.wakeup.wait(waiting).unwrap();
-                    }
+                    let status = self.wait_on(&message.status);
+                    fence(Acquire);
+                    match status {
+                        TAKE_OVER => self.run_operation(op),
+                        COMPLETED => continue,
+                        _ => unreachable!(),
+                    };
                     break;
                 }
-                fence(Acquire);
             }
         }
         rval
