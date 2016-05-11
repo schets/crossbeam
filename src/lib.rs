@@ -26,7 +26,7 @@
 
 #![cfg_attr(feature = "nightly",
             feature(const_fn, repr_simd, optin_builtin_traits))]
-
+#![feature(asm)]
 use std::thread;
 
 pub use scoped::{scope, Scope, ScopedJoinHandle};
