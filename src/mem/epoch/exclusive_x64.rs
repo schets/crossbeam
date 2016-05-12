@@ -4,6 +4,7 @@ use std::mem;
 use std::sync::atomic;
 use std::marker::PhantomData;
 
+use std::sync::atomic::{Ordering, AtomicUsize};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -11,6 +12,18 @@ struct Llsc {
     val: u64,
     counter: u64,
     extra: u64, //we adjust which is actually the real one due to alignment
+}
+
+#[inline(always)]
+unsafe fn load_from(ptr: *const u64, ord: Ordering) -> u64 {
+    let ptr: *const AtomicUsize = mem::transmute(ptr);
+    (&*ptr).load(ord) as u64
+}
+
+#[inline(always)]
+unsafe fn store_to(ptr: *const u64, n: u64, ord: Ordering) {
+    let ptr: *const AtomicUsize = mem::transmute(ptr);
+    (&*ptr).store(n as usize, ord)
 }
 
 // please add alignment specifications...
@@ -22,30 +35,27 @@ impl Llsc {
         // otherwise, will keep address of counter
     }
 
-    pub unsafe fn get_vals(&self) -> (u64, u64) {
+    pub unsafe fn get_vals(&self, ord: Ordering) -> (u64, u64) {
         let adj_ptr = self.get_ptr();
         if adj_ptr == mem::transmute(self) {
-            (self.val, self.counter)
+            (load_from(&self.val, ord), self.counter)
         }
         else {
-            (self.counter, self.extra)
+            (load_from(&self.counter, ord), self.extra)
         }
     }
 
-    pub unsafe fn set_vals(&mut self, vals: (u64, u64)) {
+    pub unsafe fn set_val(&self, val: u64, ord: Ordering) {
         let adj_ptr = self.get_ptr() as u64;
-        let self_addr = (self as *mut Llsc) as u64;
+        let self_addr = (self as *const Llsc) as u64;
         if adj_ptr == self_addr {
-            self.val = vals.0;
-            self.counter = vals.1;
+            store_to(&self.val, val, ord);
         }
         else {
-            self.counter = vals.0;
-            self.extra = vals.0;
+            store_to(&self.counter, val, ord);
         }
     }
 }
-
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -70,20 +80,19 @@ impl LlscBool {
 }
 
 #[inline(always)]
-unsafe fn cas_tagged(ptr: *const u64, old: (u64, u64), nval: u64) -> (u64, u64) {
+unsafe fn cas_tagged(ptr: *const u64, old: (u64, u64), nval: u64) -> bool {
     let val: u64 = old.0;
     let counter: u64 = old.1;
-    let mut ncounter: u64 = counter.wrapping_add(1);
-    let mut new = nval;
-    println!("Here!");
-    dummyfn();
-    asm!("lock cmpxchg16b ($6)\n\t"
-         : "={rbx}" (new), "={rcx}" (ncounter)
-         : "{rax}"(val), "{rdx}"(counter), "0"(new), "1"(ncounter), "r"(ptr)
+    let ncounter: u64 = counter.wrapping_add(1);
+    let new = nval;
+    let succ: bool;
+    asm!("lock cmpxchg16b ($5)\n\t
+          sete $0\n\t"
+         : "=r" (succ)
+         : "{rax}"(val), "{rdx}"(counter), "{rbx}"(new), "{rcx}"(ncounter), "r"(ptr)
          : "memory"
          : "volatile");
-    // either unchanged, or rbx/rcx are reloaded with the actual values
-    (new, ncounter)
+    succ
 }
 
 
@@ -99,8 +108,6 @@ pub struct LinkedPtr<'a, T: 'a> {
     borrowck: &'a ExclusivePtr<T>,
 }
 
-#[inline(never)]
-pub fn dummyfn() {}
 impl<T> ExclusivePtr<T> {
 
     pub fn new(ptr: *mut T) -> ExclusivePtr<T> {
@@ -114,14 +121,22 @@ impl<T> ExclusivePtr<T> {
         }
     }
 
-    pub fn load(&self) -> *mut T {
-        unsafe { self.data.get_vals().0 as *mut T }
+    pub fn load(&self, ord: Ordering) -> *mut T {
+        unsafe { self.data.get_vals(ord).0 as *mut T }
     }
 
-    pub fn load_linked(&self) -> LinkedPtr<T> {
+    // Stores directly to the pointer without updating the counter
+    //
+    // This function can still leave one vulnerable to the ABA problem,
+    // But is useful when only used to store to say a null value.
+    pub fn store_direct(&self, val: *mut T, ord: Ordering) {
+        unsafe { self.data.set_val(val as u64, ord) };
+    }
+
+    pub fn load_linked(&self, ord: Ordering) -> LinkedPtr<T> {
         unsafe {
             LinkedPtr {
-                data: self.data.get_vals(),
+                data: self.data.get_vals(ord),
                 ptr: self.data.get_ptr(),
                 borrowck: self,
             }
@@ -130,29 +145,35 @@ impl<T> ExclusivePtr<T> {
 }
 
 impl<'a, T> LinkedPtr<'a, T> {
-    pub fn store_conditional(&self, val: *mut T) -> LinkedPtr<'a, T> {
-        unsafe {
-            LinkedPtr {
-                data: cas_tagged(self.ptr, self.data, val as u64),
-                ptr: self.ptr,
-                borrowck: self.borrowck,
-            }
-        }
+    pub fn store_conditional(self, val: *mut T, _: Ordering) -> bool {
+        unsafe { cas_tagged(self.ptr, self.data, val as u64) }
     }
 }
-
 
 #[cfg(test)]
 mod test {
     use super::*;
     use std::ptr;
+    use std::sync::atomic::Ordering::{Relaxed, Acquire, Release};
     #[test]
     fn test_cas () {
         let mut val: u64 = 0;
         let eptr = ExclusivePtr::<u64>::new(ptr::null_mut());
-        let mut ll = eptr.load_linked();
-        assert_eq!(eptr.load(), ptr::null_mut());
-        ll = ll.store_conditional(&mut val);
-        assert_eq!(eptr.load(), &mut val as *mut u64);
+        let ll = eptr.load_linked(Relaxed);
+        assert_eq!(eptr.load(Relaxed), ptr::null_mut());
+        assert_eq!(ll.store_conditional(&mut val, Relaxed), true);
+        assert_eq!(eptr.load(Relaxed), &mut val as *mut u64);
     }
+
+    #[test]
+    fn test_cas_fail () {
+        let mut val: u64 = 0;
+        let mut val2: u64 = 0;
+        let eptr = ExclusivePtr::<u64>::new(ptr::null_mut());
+        let ll = eptr.load_linked(Relaxed);
+        assert_eq!(eptr.load(Relaxed), ptr::null_mut());
+        eptr.store_direct(&mut val2, Relaxed);
+        assert_eq!(ll.store_conditional(&mut val, Relaxed), false);
+    }
+
 }
