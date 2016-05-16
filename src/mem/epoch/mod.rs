@@ -133,7 +133,6 @@ mod guard;
 mod local;
 mod participant;
 mod participants;
-mod exclusive_x64;
 
 pub use self::atomic::Atomic;
 pub use self::guard::{pin, Guard};

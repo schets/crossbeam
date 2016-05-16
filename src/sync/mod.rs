@@ -6,6 +6,7 @@ pub use self::treiber_stack::TreiberStack;
 pub use self::seg_queue::SegQueue;
 pub use self::arc_cell::ArcCell;
 
+pub mod exclusive;
 mod atomic_option;
 mod ms_queue;
 mod treiber_stack;
