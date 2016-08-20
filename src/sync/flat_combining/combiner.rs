@@ -6,6 +6,10 @@ use std::thread;
 use std::mem;
 use std::ptr;
 
+fn prefetch<T>(p: *const T) -> () {
+    unsafe { mem::forget(ptr::read_volatile(p)); }
+}
+
 const WAITING: usize = 0;
 const IN_PROGRESS: usize = 1;
 const TAKE_OVER: usize = 2;
@@ -14,15 +18,40 @@ const COMPLETED: usize = 4;
 const POISONED: usize = 5;
 
 struct Message {
-    op: *const FnMut(),
+    op: fn(*mut ()),
+    data: *mut (),
     next: AtomicPtr<Message>,
     status: AtomicUsize,
 }
 
+struct PtrWrapper {
+    pub val: *mut (),
+}
+unsafe impl Sync for PtrWrapper {}
+unsafe impl Send for PtrWrapper {}
+
+impl PtrWrapper {
+    pub fn new<T>(p : *mut T) -> PtrWrapper {
+        PtrWrapper {val : unsafe { mem::transmute(p) } }
+    }
+
+    pub fn get<T>(&self) -> *mut T {
+        unsafe {mem::transmute(self.val) }
+    }
+}
+
+fn run_operation<F: FnMut()>(p: *mut ()) {
+    unsafe {
+        let fncptr : *mut F() = mem::transmute(p);
+        (&mut *fncptr)();
+    }
+}
+
 impl Message {
-    pub fn new(op: *const FnMut()) -> Message {
+    pub fn new<F: FnMut()>(data: *mut F) -> Message {
         Message {
-            op: op,
+            op: run_operation::<F>,
+            data: unsafe { mem::transmute(data) },
             next: AtomicPtr::new(ptr::null_mut()),
             status: AtomicUsize::new(WAITING),
         }
@@ -30,7 +59,7 @@ impl Message {
 
     pub fn process(&self) {
         self.status.store(IN_PROGRESS, Relaxed);
-        unsafe { (&*self.op)() };
+        unsafe { (self.op)(self.data) };
         self.status.store(COMPLETED, Release);
 
         // Prevent reordering of on_completed after completion?
@@ -64,8 +93,8 @@ pub struct FlatCombiner {
 
     wakeup_mut: Mutex<bool>,
 }
- unsafe impl Send for FlatCombiner {}
- unsafe impl Sync for FlatCombiner {}
+unsafe impl Send for FlatCombiner {}
+unsafe impl Sync for FlatCombiner {}
 
 impl FlatCombiner {
     pub fn new() -> FlatCombiner {
@@ -82,11 +111,11 @@ impl FlatCombiner {
     fn load_messages(&self) -> Option<*mut Message> {
         // Make the local_messages check an invariant?
         if self.local_messages.get() == ptr::null_mut() &&
-           self.message_stack_head.load(Relaxed) != ptr::null_mut() {
-            let head = self.message_stack_head.swap(ptr::null_mut(), Acquire);
-            self.local_messages.set(head);
-            Some(head)
-        }
+            self.message_stack_head.load(Relaxed) != ptr::null_mut() {
+                let head = self.message_stack_head.swap(ptr::null_mut(), Acquire);
+                self.local_messages.set(head);
+                Some(head)
+            }
         else { None }
     }
 
@@ -143,6 +172,7 @@ impl FlatCombiner {
         }
         else {
             self.run_operation(op);
+            self.used.store(false, Release);
             None
         }
     }
@@ -173,14 +203,14 @@ impl FlatCombiner {
         return status.load(Relaxed);
     }
 
-    pub fn submit<F: Send + FnMut() -> R, R: Send>(&self, _op: F) -> R {
+    pub fn submit<F: Send + FnMut() -> R, R: Send>(&self, mut _op: F) -> R {
         let mut rval: R = unsafe { mem::uninitialized() };
         {
-            let rval_ref = &mut rval;
-            let op = || *rval_ref = _op();
-            if let Some(op) = self.try_operation(op) {
+            let rval_ref = PtrWrapper::new(&mut rval as *mut R);
+            let mut dirop = || unsafe { ptr::write(rval_ref.get::<R>(), _op()) };
+            if let Some(mut op) = self.try_operation(dirop) {
                 loop {
-                    let mut message = Message::new(&op);
+                    let mut message = Message::new(&mut op);
                     loop {
                         let cur_head = self.message_stack_head.load(Relaxed);
                         message.next.store(cur_head, Relaxed);
@@ -212,6 +242,8 @@ mod test {
 
     use scope;
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::Relaxed;
 
     #[test]
     pub fn test_basic() {
@@ -221,21 +253,35 @@ mod test {
         let rval = comb.submit(|| { x += 1; x+1});
         assert_eq!(rval, 2);
         assert_eq!(x, 1);
+        let rval = comb.submit(|| { x += 1; x+1});
+        assert_eq!(rval, 3);
+        assert_eq!(x, 2);
+
     }
 
     #[test]
     pub fn test_thread() {
-        let comb = FlatCombiner::new();
+        let num_loop = 10000;
+        let nthread = 4;
+        let _comb = FlatCombiner::new();
+        let val = AtomicUsize::new(0);
+        let in_area = AtomicUsize::new(0);
         scope(|scope| {
-            scope.spawn( || {
-                for _ in 0..1000 {
-                    let mut x = 0;
-
-                    let rval = comb.submit(|| { x += 1; x+1});
-                    assert_eq!(rval, 2);
-                    assert_eq!(x, 1);
-                }
-            })
+            for i in 0..nthread {
+                scope.spawn( || {
+                    let comb = &_comb;
+                    for i in 0..num_loop {
+                        comb.submit(|| {
+                            let oldval = in_area.fetch_add(1, Relaxed);
+                            //assert_eq!(oldval, 0);
+                            let cval = val.load(Relaxed);
+                            val.store(cval + 1, Relaxed);
+                            in_area.fetch_sub(1, Relaxed);
+                        });
+                    }
+                });
+            }
         });
+        assert_eq!(val.load(Relaxed), nthread*num_loop);
     }
 }
