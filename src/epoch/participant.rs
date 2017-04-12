@@ -2,7 +2,7 @@
 // of the actual epoch management logic happens!
 
 use std::mem;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt;
 use std::sync::atomic::{self, AtomicUsize, AtomicBool};
 use std::sync::atomic::Ordering::{Relaxed, Acquire, Release, SeqCst};
@@ -32,7 +32,6 @@ pub struct Participant {
     /// The participant list is coded intrusively; here's the `next` pointer.
     pub next: Atomic<ParticipantNode>,
 }
-
 impl fmt::Debug for Participant {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Participant {{ ... }}")
@@ -64,7 +63,6 @@ impl Participant {
     /// Returns `true` is this is the first entry on the stack (as opposed to a
     /// re-entrant call).
     pub fn enter(&self) -> bool {
-        self.budget.set(MAX_FREE);
         let new_count = self.in_critical.load(Relaxed) + 1;
         self.in_critical.store(new_count, Relaxed);
         if new_count > 1 { return false }
@@ -74,13 +72,14 @@ impl Participant {
         let global_epoch = global::get().epoch.load(Relaxed);
         if global_epoch != self.epoch.load(Relaxed) {
             self.epoch.store(global_epoch, Relaxed);
-            unsafe { (*self.garbage.get()).collect(); }
+            unsafe { self.budget.set((*self.garbage.get()).collect(MAX_FREE)); }
+        }
+        else { 
+            self.budget.set(MAX_FREE);
         }
         unsafe {
             let gb = &mut *self.garbage.get();
-            if gb.has_pending() && self.budget.get() > 0 {
-                self.budget.set(gb.collect_pending(self.budget.get()));
-            }
+            self.budget.set(gb.collect_pending(self.budget.get()));
         }
 
         true
@@ -118,7 +117,7 @@ impl Participant {
         }
 
         unsafe {
-            (*self.garbage.get()).collect();
+            self.budget.set((*self.garbage.get()).collect(self.budget.get()));
             global::get().garbage[new_epoch.wrapping_add(1) % 3].collect();
         }
         self.epoch.store(new_epoch, Release);

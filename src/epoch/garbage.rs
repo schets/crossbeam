@@ -30,6 +30,7 @@ pub struct Bag(Vec<Item>);
 
 /// A collection of bags pending incremental collection
 
+#[derive(Debug)]
 struct PendingBags {
     waiting: VecDeque<VecDeque<Item>>,
     size: usize,
@@ -70,27 +71,39 @@ impl Bag {
 
 impl PendingBags {
 
-    #[inline(always)]
-    pub fn has_pending(&self) -> bool {
-        self.size == 0
+    pub fn new() -> PendingBags {
+        PendingBags {
+            size: 0,
+            waiting: VecDeque::new()
+        }
     }
 
-    pub fn add_bag(&mut self, mut to_add: Bag) {
-        self.size += to_add.size();
+    #[inline(always)]
+    pub fn has_pending(&self) -> bool {
+        self.size > 0
+    }
+
+    #[inline(always)]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn add_bag(&mut self, to_add: Bag) {
+        self.size += to_add.len();
         self.waiting.push_back(VecDeque::from(to_add.0));
     }
 
-    pub unsafe fn collect_pending(&mut self, budget: usize) -> usize {
+    pub unsafe fn collect_pending(&mut self, mut budget: usize) -> usize {
         while budget > 0 && !self.waiting.is_empty() {
-            let bag = self.waiting.pop_front().unwrap();
-            let to_free = cmp::min(budget, recent_bag.0.len());
+            let mut bag = self.waiting.pop_front().unwrap();
+            let to_free = cmp::min(budget, bag.len());
             budget -= to_free;
             self.size -= to_free;
-            for item in recent_bag.0.drain(..to_free) {
+            for item in bag.drain(..to_free) {
                 (item.free)(item.ptr);
             }
-            if !recent_bag.is_empty() {
-                self.waiting.push_front(recent_bag);
+            if !bag.is_empty() {
+                self.waiting.push_front(bag);
             }
         }
         budget
@@ -114,7 +127,7 @@ pub struct Local {
     pub new: Bag,
 
     /// Garbage waiting to be collected
-    pub pending: PendingBags,
+    pending: PendingBags,
 }
 
 impl Local {
@@ -133,13 +146,13 @@ impl Local {
 
     /// Collect one epoch of garbage, rotating the local garbage bags.
     pub unsafe fn collect(&mut self, mut budget: usize) -> usize {
-        if (budget >= self.old.size()) {
-            budget -= self.old.size();
+        if budget >= self.old.len() + self.pending.size() {
+            budget -= self.old.len();
             self.old.collect();
         }
         else {
             let mut old_b = Bag::new();
-            mem::swap(self.old, &mut old_b);
+            mem::swap(&mut self.old, &mut old_b);
             self.pending.add_bag(old_b);
         }
         mem::swap(&mut self.old, &mut self.cur);
@@ -151,9 +164,12 @@ impl Local {
     }
 
     #[inline(always)]
-    pub unsafe fn collect_pending(&mut self, mut budget: usize) -> usize {
+    pub unsafe fn collect_pending(&mut self, budget: usize) -> usize {
         if self.pending.has_pending() {
-            self.pending.collect_pending();
+            self.pending.collect_pending(budget)
+        }
+        else {
+            budget
         }
     }
 
