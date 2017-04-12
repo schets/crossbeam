@@ -6,6 +6,8 @@
 // thread is exiting, these bags must be moved into the global garbage
 // bags.
 
+use std::cmp;
+use std::collections::VecDeque;
 use std::ptr;
 use std::mem;
 use std::sync::atomic::AtomicPtr;
@@ -25,6 +27,13 @@ struct Item {
 /// A single, thread-local bag of garbage.
 #[derive(Debug)]
 pub struct Bag(Vec<Item>);
+
+/// A collection of bags pending incremental collection
+
+struct PendingBags {
+    waiting: VecDeque<VecDeque<Item>>,
+    size: usize,
+}
 
 impl Bag {
     fn new() -> Bag {
@@ -59,6 +68,37 @@ impl Bag {
     }
 }
 
+impl PendingBags {
+
+    #[inline(always)]
+    pub fn has_pending(&self) -> bool {
+        self.size == 0
+    }
+
+    pub fn add_bag(&mut self, mut to_add: Bag) {
+        self.size += to_add.size();
+        self.waiting.push_back(VecDeque::from(to_add.0));
+    }
+
+    pub unsafe fn collect_pending(&mut self, budget: usize) -> usize {
+        while budget > 0 && !self.waiting.is_empty() {
+            let bag = self.waiting.pop_front().unwrap();
+            let to_free = cmp::min(budget, recent_bag.0.len());
+            budget -= to_free;
+            self.size -= to_free;
+            for item in recent_bag.0.drain(..to_free) {
+                (item.free)(item.ptr);
+            }
+            if !recent_bag.is_empty() {
+                self.waiting.push_front(recent_bag);
+            }
+        }
+        budget
+    }
+
+    pub fn evict_to_global(&mut self) {}
+}
+
 // needed because the bags store raw pointers.
 unsafe impl Send for Bag {}
 unsafe impl Sync for Bag {}
@@ -72,6 +112,9 @@ pub struct Local {
     pub cur: Bag,
     /// Garbage added in the current *global* epoch
     pub new: Bag,
+
+    /// Garbage waiting to be collected
+    pub pending: PendingBags,
 }
 
 impl Local {
@@ -80,6 +123,7 @@ impl Local {
             old: Bag::new(),
             cur: Bag::new(),
             new: Bag::new(),
+            pending: PendingBags::new(),
         }
     }
 
@@ -88,11 +132,29 @@ impl Local {
     }
 
     /// Collect one epoch of garbage, rotating the local garbage bags.
-    pub unsafe fn collect(&mut self) {
-        let ret = self.old.collect();
+    pub unsafe fn collect(&mut self, mut budget: usize) -> usize {
+        if (budget >= self.old.size()) {
+            budget -= self.old.size();
+            self.old.collect();
+        }
+        else {
+            let mut old_b = Bag::new();
+            mem::swap(self.old, &mut old_b);
+            self.pending.add_bag(old_b);
+        }
         mem::swap(&mut self.old, &mut self.cur);
         mem::swap(&mut self.cur, &mut self.new);
-        ret
+
+        budget = self.pending.collect_pending(budget);
+        self.pending.evict_to_global();
+        budget
+    }
+
+    #[inline(always)]
+    pub unsafe fn collect_pending(&mut self, mut budget: usize) -> usize {
+        if self.pending.has_pending() {
+            self.pending.collect_pending();
+        }
     }
 
     pub fn size(&self) -> usize {

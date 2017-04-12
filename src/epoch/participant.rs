@@ -22,6 +22,9 @@ pub struct Participant {
     /// Thread-local garbage tracking
     garbage: UnsafeCell<garbage::Local>,
 
+    /// Number of items left to free this session
+    budget: Cell<usize>,
+
     /// Is the thread still active? Becomes `false` when the thread exits. This
     /// is ultimately used to free `Participant` records.
     pub active: AtomicBool,
@@ -40,11 +43,14 @@ unsafe impl Sync for Participant {}
 
 const GC_THRESH: usize = 32;
 
+const MAX_FREE: usize = 32;
+
 impl Participant {
     pub fn new() -> Participant {
         Participant {
             epoch: AtomicUsize::new(0),
             in_critical: AtomicUsize::new(0),
+            budget: Cell::new(MAX_FREE),
             active: AtomicBool::new(true),
             garbage: UnsafeCell::new(garbage::Local::new()),
             next: Atomic::null(),
@@ -58,6 +64,7 @@ impl Participant {
     /// Returns `true` is this is the first entry on the stack (as opposed to a
     /// re-entrant call).
     pub fn enter(&self) -> bool {
+        self.budget.set(MAX_FREE);
         let new_count = self.in_critical.load(Relaxed) + 1;
         self.in_critical.store(new_count, Relaxed);
         if new_count > 1 { return false }
@@ -68,6 +75,12 @@ impl Participant {
         if global_epoch != self.epoch.load(Relaxed) {
             self.epoch.store(global_epoch, Relaxed);
             unsafe { (*self.garbage.get()).collect(); }
+        }
+        unsafe {
+            let gb = &mut *self.garbage.get();
+            if gb.has_pending() && self.budget.get() > 0 {
+                self.budget.set(gb.collect_pending(self.budget.get()));
+            }
         }
 
         true
